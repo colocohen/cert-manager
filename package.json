@@ -1,0 +1,57 @@
+{
+  "name": "cert-manager",
+  "version": "0.1.0",
+  "description": "ACME client with automatic certificate management for Node.js. Zero dependencies.",
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "require": "./index.cjs",
+      "types": "./index.d.ts"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.cjs",
+    "index.d.ts",
+    "src/"
+  ],
+  "keywords": [
+    "ssl",
+    "tls",
+    "acme",
+    "letsencrypt",
+    "zerossl",
+    "certificate",
+    "https",
+    "wildcard",
+    "dns-01",
+    "auto-renew",
+    "rfc8555",
+    "x509",
+    "csr",
+    "pem",
+    "ecdsa"
+  ],
+  "author": {
+    "name": "colocohen"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/cert-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/cert-manager/issues"
+  },
+  "homepage": "https://github.com/colocohen/cert-manager#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ]
+}
