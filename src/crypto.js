@@ -1,7 +1,9 @@
 
 import * as crypto from 'node:crypto';
+import { domainToASCII } from 'node:url';
 import {
-  SEQUENCE, SET, INTEGER, BIT_STRING, OCTET_STRING, OID, UTF8STRING, IA5STRING, EXPLICIT,
+  SEQUENCE, SET, INTEGER, BIT_STRING, OCTET_STRING, OID, UTF8STRING, IA5STRING,
+  PRINTABLESTRING, ASN1_NULL, EXPLICIT,
   encode_tag,
   OID_COMMON_NAME, OID_COUNTRY, OID_STATE, OID_LOCALITY, OID_ORGANIZATION, OID_ORG_UNIT,
   OID_EMAIL, OID_SAN, OID_EXTENSION_REQUEST,
@@ -21,6 +23,9 @@ function generateKey(type, options) {
 
   if (type === 'rsa') {
     let size = options.size || 2048;
+    if (size < 2048) {
+      throw new Error('RSA key size must be at least 2048 bits (got ' + size + ')');
+    }
     let pair = crypto.generateKeyPairSync('rsa', {
       modulusLength: size,
       publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -29,11 +34,17 @@ function generateKey(type, options) {
     return pair.privateKey;
   }
 
-  // ecdsa
+  if (type !== 'ecdsa') {
+    throw new Error('Unsupported key type: ' + type + ' (supported: ecdsa, rsa)');
+  }
+
+  // ecdsa — map NIST names to OpenSSL curve names (works on all Node versions)
   let curve = options.curve || 'P-256';
-  let namedCurve = curve === 'P-384' ? 'P-384' : 'prime256v1';
-  if (curve === 'P-384') namedCurve = 'P-384';
-  if (curve === 'P-256') namedCurve = 'P-256';
+  let curve_map = { 'P-256': 'prime256v1', 'P-384': 'secp384r1' };
+  let namedCurve = curve_map[curve];
+  if (!namedCurve) {
+    throw new Error('Unsupported curve: ' + curve + ' (supported: P-256, P-384)');
+  }
 
   let pair = crypto.generateKeyPairSync('ec', {
     namedCurve: namedCurve,
@@ -74,10 +85,31 @@ function getJwkThumbprint(jwk) {
     ordered = JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y });
   } else if (jwk.kty === 'RSA') {
     ordered = JSON.stringify({ e: jwk.e, kty: jwk.kty, n: jwk.n });
+  } else {
+    throw new Error('Unsupported JWK key type: ' + jwk.kty + ' (supported: EC, RSA)');
   }
 
   let hash = crypto.createHash('sha256').update(ordered).digest();
   return base64url(hash);
+}
+
+
+/**
+ * Convert a domain to ASCII (punycode) for use in identifiers, SANs and CN.
+ * Handles a leading wildcard label ("*.") which domainToASCII rejects.
+ * Returns the input unchanged if conversion fails (already ASCII / invalid).
+ */
+function toAsciiDomain(name) {
+  if (typeof name !== 'string') return name;
+  let wildcard = false;
+  let n = name;
+  if (n.indexOf('*.') === 0) {
+    wildcard = true;
+    n = n.substring(2);
+  }
+  let ascii = domainToASCII(n);
+  if (!ascii) ascii = n;
+  return (wildcard ? '*.' : '') + ascii;
 }
 
 
@@ -88,8 +120,8 @@ function getJwkThumbprint(jwk) {
 function buildSanExtension(names) {
   let parts = [];
   for (let i = 0; i < names.length; i++) {
-    // dNSName is context tag [2], implicit
-    let encoded = new TextEncoder().encode(names[i]);
+    // dNSName is context tag [2], implicit — must be ASCII (punycode for IDN)
+    let encoded = new TextEncoder().encode(toAsciiDomain(names[i]));
     parts.push(encode_tag(0x82, encoded));
   }
   let total = 0;
@@ -111,8 +143,8 @@ function buildSanExtension(names) {
  * Returns DER Uint8Array.
  */
 function createCsr(options, private_key_pem) {
-  let commonName = options.commonName || options.domain;
-  let altNames = options.altNames || [];
+  let commonName = toAsciiDomain(options.commonName || options.domain);
+  let altNames = (options.altNames || []).map(toAsciiDomain);
   let emailAddress = options.emailAddress || null;
 
   // Ensure commonName is in altNames
@@ -136,9 +168,13 @@ function createCsr(options, private_key_pem) {
     ])
   ]));
 
-  // Country (C)
+  // Country (C) — X.520 mandates PrintableString of exactly 2 characters
   if (options.country) {
-    subject_parts.push(SET([ SEQUENCE([ OID(OID_COUNTRY), UTF8STRING(options.country) ]) ]));
+    let country = String(options.country).toUpperCase();
+    if (!/^[A-Z]{2}$/.test(country)) {
+      throw new Error('country must be a 2-letter ISO 3166 code (got "' + options.country + '")');
+    }
+    subject_parts.push(SET([ SEQUENCE([ OID(OID_COUNTRY), PRINTABLESTRING(country) ]) ]));
   }
 
   // State (ST)
@@ -221,10 +257,17 @@ function createCsr(options, private_key_pem) {
   signer.update(cri);
   let signature = signer.sign(key_obj);
 
+  // AlgorithmIdentifier:
+  //  - ECDSA (RFC 5754 §3.3): parameters field MUST be absent
+  //  - RSA   (RFC 5754 §3.2): parameters field MUST be an explicit NULL
+  let sig_alg = (key_type === 'ec')
+    ? SEQUENCE([OID(sig_alg_oid)])
+    : SEQUENCE([OID(sig_alg_oid), ASN1_NULL()]);
+
   // Build CSR
   let csr = SEQUENCE([
     cri,
-    SEQUENCE([OID(sig_alg_oid)]),
+    sig_alg,
     BIT_STRING(new Uint8Array(signature)),
   ]);
 
@@ -254,10 +297,16 @@ function signJws(payload, protected_header, private_key_pem) {
 
   let signing_input = protected_b64 + '.' + payload_b64;
 
+  // Hash must match the JWS "alg" header (see getAlgFromKey in http.js):
+  // P-256 → ES256/sha256, P-384 → ES384/sha384, P-521 → ES512/sha512, RSA → RS256/sha256
   let alg = 'sha256';
   if (key_type === 'ec') {
     let jwk = key_obj.export({ format: 'jwk' });
     if (jwk.crv === 'P-384') alg = 'sha384';
+    else if (jwk.crv === 'P-521') alg = 'sha512';
+    else if (jwk.crv !== 'P-256') {
+      throw new Error('Unsupported EC curve for JWS: ' + jwk.crv);
+    }
   }
 
   let signer = crypto.createSign(alg);
@@ -327,6 +376,22 @@ function signEab(eab_kid, eab_hmac_key, account_jwk, url) {
 }
 
 
+/**
+ * Encode DER bytes as PEM with the given label.
+ * pemEncode(der, 'CERTIFICATE REQUEST') → '-----BEGIN CERTIFICATE REQUEST-----\n...'
+ * Strings are returned unchanged (assumed to already be PEM).
+ */
+function pemEncode(der, label) {
+  if (typeof der === 'string') return der;
+  let b64 = Buffer.from(der).toString('base64');
+  let lines = [];
+  for (let i = 0; i < b64.length; i += 64) {
+    lines.push(b64.substring(i, i + 64));
+  }
+  return '-----BEGIN ' + label + '-----\n' + lines.join('\n') + '\n-----END ' + label + '-----\n';
+}
+
+
 export {
   generateKey,
   getJwk,
@@ -335,4 +400,6 @@ export {
   signJws,
   signEab,
   base64url,
+  pemEncode,
+  toAsciiDomain,
 };

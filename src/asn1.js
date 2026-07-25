@@ -26,8 +26,8 @@ function encode_tag(tag, content) {
   return out;
 }
 
-// ASN.1 types
-function SEQUENCE(parts) {
+// Concatenate multiple Uint8Arrays into one
+function concat_parts(parts) {
   let total = 0;
   for (let i = 0; i < parts.length; i++) total += parts[i].length;
   let content = new Uint8Array(total);
@@ -36,19 +36,16 @@ function SEQUENCE(parts) {
     content.set(parts[i], off);
     off += parts[i].length;
   }
-  return encode_tag(0x30, content);
+  return content;
+}
+
+// ASN.1 types
+function SEQUENCE(parts) {
+  return encode_tag(0x30, concat_parts(parts));
 }
 
 function SET(parts) {
-  let total = 0;
-  for (let i = 0; i < parts.length; i++) total += parts[i].length;
-  let content = new Uint8Array(total);
-  let off = 0;
-  for (let i = 0; i < parts.length; i++) {
-    content.set(parts[i], off);
-    off += parts[i].length;
-  }
-  return encode_tag(0x31, content);
+  return encode_tag(0x31, concat_parts(parts));
 }
 
 function INTEGER(value) {
@@ -112,6 +109,16 @@ function UTF8STRING(str) {
   return encode_tag(0x0C, new TextEncoder().encode(str));
 }
 
+// X.520 mandates PrintableString for countryName (C)
+function PRINTABLESTRING(str) {
+  return encode_tag(0x13, new TextEncoder().encode(str));
+}
+
+// ASN.1 NULL — required parameter for RSA AlgorithmIdentifier (RFC 5754)
+function ASN1_NULL() {
+  return encode_tag(0x05, new Uint8Array(0));
+}
+
 function IA5STRING(str) {
   return encode_tag(0x16, new TextEncoder().encode(str));
 }
@@ -148,6 +155,7 @@ const OID_P384 = '1.3.132.0.34';
 export {
   encode_length,
   encode_tag,
+  concat_parts,
   SEQUENCE,
   SET,
   INTEGER,
@@ -156,6 +164,8 @@ export {
   OID,
   UTF8STRING,
   IA5STRING,
+  PRINTABLESTRING,
+  ASN1_NULL,
   EXPLICIT,
   OID_COMMON_NAME,
   OID_COUNTRY,

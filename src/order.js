@@ -2,7 +2,7 @@
 import { EventEmitter } from 'node:events';
 import * as nodeCrypto from 'node:crypto';
 import { AcmeHttp } from './http.js';
-import { generateKey, getJwk, getJwkThumbprint, createCsr, signJws, signEab, base64url } from './crypto.js';
+import { generateKey, getJwk, getJwkThumbprint, createCsr, signJws, signEab, base64url, pemEncode, toAsciiDomain } from './crypto.js';
 import { verifyDnsChallenge, checkCaa } from './verify.js';
 import { PROVIDERS } from './providers.js';
 
@@ -25,6 +25,7 @@ function Order(options) {
     staging: !!options.staging,
 
     accountKey: options.accountKey || null,
+    accountUrl: options.accountUrl || null,  // known account URL — skips newAccount round-trip
     privateKey: options.privateKey || null,
     csr: options.csr || null,
 
@@ -41,7 +42,9 @@ function Order(options) {
     preflight: options.preflight !== false,
     autoVerify: options.autoVerify !== false,
     autoVerifyInterval: options.autoVerifyInterval || 5000,
-    autoVerifyRetries: options.autoVerifyRetries || 10,
+    autoVerifyRetries: options.autoVerifyRetries || 60,     // 60 × 5s = 5 min for DNS propagation
+    validatingInterval: options.validatingInterval || 3000,
+    validatingRetries: options.validatingRetries || 40,     // 40 × 3s = 2 min for CA validation
     autoStart: !!options.autoStart,
 
     preflight_done: false,
@@ -51,8 +54,8 @@ function Order(options) {
     privateKey_generated: false,
     csr_generated: false,
 
-    account_url: null,
-    account_created: false,
+    account_url: options.accountUrl || null,
+    account_created: !!options.accountUrl,
 
     order_url: null,
     order_data: null,
@@ -71,6 +74,8 @@ function Order(options) {
     verify_attempt: 0,
     verify_timer: null,
     all_verified: false,
+
+    validating_attempt: 0,
 
     challenges_completed: false,
     all_valid: false,
@@ -110,24 +115,80 @@ function Order(options) {
     _auths_fetching: false,
     _preflight_running: false,
     _cert_fetching: false,
+
+    // polling loop guards — one round in flight at a time, next round is
+    // scheduled only after the previous one fully completed (no pile-up)
+    _verify_running: false,
+    _validating_running: false,
+    _ready_running: false,
+    _processing_running: false,
   };
+
+
+  // --- Error handling ---
+  // On any error: stop all timers, release in-progress flags, move to 'error'
+  // state so getState() reflects reality, and emit safely (a bare EventEmitter
+  // 'error' with no listener crashes the whole process).
+
+  function clearAllTimers() {
+    let timers = ['verify_timer', 'validating_timer', 'ready_timer', 'processing_timer'];
+    for (let i = 0; i < timers.length; i++) {
+      if (context[timers[i]]) {
+        clearTimeout(context[timers[i]]);
+        context[timers[i]] = null;
+      }
+    }
+  }
+
+  function clearProgressFlags() {
+    context._completing_in_progress = false;
+    context._finalizing_in_progress = false;
+    context._directory_loading = false;
+    context._account_creating = false;
+    context._order_creating = false;
+    context._auths_fetching = false;
+    context._preflight_running = false;
+    context._cert_fetching = false;
+    context._verify_running = false;
+    context._validating_running = false;
+    context._ready_running = false;
+    context._processing_running = false;
+  }
+
+  function emitError(err, step) {
+    clearAllTimers();
+    clearProgressFlags();
+    if (context.aborted === false && context.state !== 'error') {
+      let old_state = context.state;
+      context.state = 'error';
+      ev.emit('state', 'error', old_state);
+    }
+    if (ev.listenerCount('error') > 0) {
+      ev.emit('error', err, step);
+    } else {
+      // Never crash the host process because the consumer forgot a listener
+      console.error('[cert-manager] unhandled order error at step "' + step + '":', err && err.message ? err.message : err);
+    }
+  }
 
 
   function buildIdentifiers() {
     let ids = [];
-    if (context.domain) {
-      ids.push({ type: 'dns', value: context.domain });
+    let domain = toAsciiDomain(context.domain);
+    if (domain) {
+      ids.push({ type: 'dns', value: domain });
     }
-    if (context.wildcard && context.domain) {
-      ids.push({ type: 'dns', value: '*.' + context.domain });
+    if (context.wildcard && domain) {
+      ids.push({ type: 'dns', value: '*.' + domain });
     }
     if (context.altNames) {
       for (let i = 0; i < context.altNames.length; i++) {
+        let alt = toAsciiDomain(context.altNames[i]);
         let found = false;
         for (let j = 0; j < ids.length; j++) {
-          if (ids[j].value === context.altNames[i]) { found = true; break; }
+          if (ids[j].value === alt) { found = true; break; }
         }
-        if (!found) ids.push({ type: 'dns', value: context.altNames[i] });
+        if (!found) ids.push({ type: 'dns', value: alt });
       }
     }
     return ids;
@@ -273,12 +334,12 @@ function Order(options) {
         let provider_info = PROVIDERS[context.provider] || PROVIDERS.letsencrypt;
         let caa_domain = provider_info.caa || null;
 
-        checkCaa(context.domain, caa_domain, function(err, caa) {
+        checkCaa(context.domain, caa_domain, { wildcard: context.wildcard }, function(err, caa) {
           if (context.aborted) return;
-          if (err) { ev.emit('error', err, 'preflight'); return; }
+          if (err) { emitError(err, 'preflight'); return; }
 
           if (caa.exists === true && caa.allowed === false) {
-            ev.emit('error', new Error('CAA record does not allow ' + caa_domain + ' to issue certificates for ' + context.domain), 'preflight');
+            emitError(new Error('CAA record does not allow ' + caa_domain + ' to issue certificates for ' + context.domain), 'preflight');
             return;
           }
 
@@ -291,7 +352,7 @@ function Order(options) {
         context._directory_loading = true;
         context.http.getDirectory(function(err) {
           if (context.aborted) return;
-          if (err) { ev.emit('error', err, 'account'); return; }
+          if (err) { emitError(err, 'account'); return; }
           set_context({ directory_loaded: true, state: 'account' });
         });
       }
@@ -303,9 +364,14 @@ function Order(options) {
         context._directory_loading = true;
         context.http.getDirectory(function(err) {
           if (context.aborted) return;
-          if (err) { ev.emit('error', err, 'account'); return; }
+          if (err) { emitError(err, 'account'); return; }
           set_context({ directory_loaded: true });
         });
+      }
+
+      // Account already known (accountUrl provided) — skip newAccount entirely
+      if (context.state === 'account' && context.directory_loaded === true && context.account_created === true && context.account_url !== null) {
+        params_to_set['state'] = 'order';
       }
 
       if (context.state === 'account' && context.directory_loaded === true && context.account_created === false && context.accountKey !== null && context._account_creating === false) {
@@ -331,7 +397,7 @@ function Order(options) {
 
           context.http.signedRequest(new_account_url, payload, context.accountKey, null, function(err, res) {
             if (context.aborted) return;
-            if (err) { ev.emit('error', err, 'account'); return; }
+            if (err) { emitError(err, 'account'); return; }
 
             if (res.status === 200 || res.status === 201) {
               let acct_url = res.headers['location'] || null;
@@ -344,7 +410,7 @@ function Order(options) {
                 state: 'order',
               });
             } else {
-              ev.emit('error', new Error('Account creation failed: HTTP ' + res.status + ' ' + JSON.stringify(res.json)), 'account');
+              emitError(new Error('Account creation failed: HTTP ' + res.status + ' ' + JSON.stringify(res.json)), 'account');
             }
           });
         }
@@ -361,18 +427,54 @@ function Order(options) {
 
           context.http.signedRequest(new_order_url, { identifiers: context.identifiers }, context.accountKey, context.account_url, function(err, res) {
             if (context.aborted) return;
-            if (err) { ev.emit('error', err, 'order'); return; }
+            if (err) { emitError(err, 'order'); return; }
 
             if (res.status === 201) {
-              set_context({
+              let order_status = res.json ? res.json.status : null;
+
+              let next = {
                 order_url: res.headers['location'] || null,
                 order_data: res.json,
                 order_created: true,
                 finalize_url: res.json.finalize || null,
-                state: 'challenges',
-              });
+              };
+
+              if (order_status === 'ready') {
+                // Authorization reuse (common on renewals with an existing account):
+                // the CA already validated us — no DNS records needed, go straight to finalize.
+                next.authorizations_fetched = true;
+                next.authorizations = [];
+                next.challenges = [];
+                next.challenges_ready = true;
+                next.challenges_emitted = true;
+                next.challenges_done = true;
+                next.all_verified = true;
+                next.challenges_submitted = true;
+                next.all_authorizations_valid = true;
+                next.order_ready = true;
+                next.state = 'finalizing';
+              } else if (order_status === 'valid' && res.json.certificate) {
+                // Order already has a certificate — just download it.
+                next.authorizations_fetched = true;
+                next.authorizations = [];
+                next.challenges = [];
+                next.challenges_ready = true;
+                next.challenges_emitted = true;
+                next.challenges_done = true;
+                next.all_verified = true;
+                next.challenges_submitted = true;
+                next.all_authorizations_valid = true;
+                next.order_ready = true;
+                next.order_finalized = true;
+                next.certificate_url = res.json.certificate;
+                next.state = 'certificate';
+              } else {
+                next.state = 'challenges';
+              }
+
+              set_context(next);
             } else {
-              ev.emit('error', new Error('Order creation failed: HTTP ' + res.status + ' ' + JSON.stringify(res.json)), 'order');
+              emitError(new Error('Order creation failed: HTTP ' + res.status + ' ' + JSON.stringify(res.json)), 'order');
             }
           });
         }
@@ -411,7 +513,7 @@ function Order(options) {
                   if (auth_results.length > 0) {
                     set_context({ authorizations: auth_results, authorizations_fetched: true });
                   } else {
-                    ev.emit('error', err || new Error('Failed to fetch authorizations'), 'challenge');
+                    emitError(err || new Error('Failed to fetch authorizations'), 'challenge');
                   }
                 }
               });
@@ -426,9 +528,13 @@ function Order(options) {
       if (context.authorizations_fetched === true && context.challenges_ready === false && context.authorizations !== null && context.jwk_thumbprint !== null) {
 
         let all_challenges = [];
+        let had_authorizations = context.authorizations.length > 0;
 
         for (let a = 0; a < context.authorizations.length; a++) {
           let auth = context.authorizations[a];
+          // Skip authorizations the CA already validated (authorization reuse) —
+          // responding to their challenges again would be rejected.
+          if (auth.status === 'valid') continue;
           if (!auth.challenges) continue;
 
           for (let b = 0; b < auth.challenges.length; b++) {
@@ -456,6 +562,17 @@ function Order(options) {
 
         params_to_set['challenges'] = all_challenges;
         params_to_set['challenges_ready'] = true;
+
+        if (had_authorizations && all_challenges.length === 0) {
+          // Every authorization was already valid — nothing to prove.
+          // Skip dns/verify/completing entirely and poll the order until 'ready'.
+          params_to_set['challenges_emitted'] = true;
+          params_to_set['challenges_done'] = true;
+          params_to_set['all_verified'] = true;
+          params_to_set['challenges_submitted'] = true;
+          params_to_set['all_authorizations_valid'] = true;
+          params_to_set['state'] = 'ready';
+        }
       }
 
 
@@ -473,22 +590,27 @@ function Order(options) {
             type: 'TXT',
             name: context.challenges[i].domain,
             value: context.challenges[i].value,
+            required: true,
           });
         }
 
+        // CAA records are OPTIONAL: per RFC 8659, absence of CAA means any CA
+        // may issue. These are only a recommendation to restrict issuance —
+        // automation should NOT create them blindly (check record.required).
         if (caa_domain) {
-          let needs_caa = true;
+          let suggest_caa = true;
           if (context.preflight_result && context.preflight_result.caa) {
             if (context.preflight_result.caa.exists === true && context.preflight_result.caa.allowed === true) {
-              needs_caa = false;
+              suggest_caa = false;
             }
           }
 
-          if (needs_caa) {
+          if (suggest_caa) {
             records.push({
               type: 'CAA',
               name: context.domain,
               value: '0 issue "' + caa_domain + '"',
+              required: false,
             });
 
             if (context.wildcard) {
@@ -496,12 +618,18 @@ function Order(options) {
                 type: 'CAA',
                 name: context.domain,
                 value: '0 issuewild "' + caa_domain + '"',
+                required: false,
               });
             }
           }
         }
 
+        let done_called = false;
+
         function done(opts) {
+          if (done_called) return;
+          done_called = true;
+
           opts = opts || {};
           let skip_verify = opts.skipVerify || false;
 
@@ -528,60 +656,64 @@ function Order(options) {
 
       // --- STATE: verifying (autoVerify polling) ---
 
-      if (context.state === 'verifying' && context.challenges_done === true && context.all_verified === false) {
+      if (context.state === 'verifying' && context.challenges_done === true && context.all_verified === false && context._verify_running === false) {
 
-        if (context.verify_timer === null) {
+        context._verify_running = true;
 
-          function doVerify() {
-            if (context.aborted) return;
-
-            let total = context.challenges.length;
-            let ok_count = 0;
-            let checked = 0;
-            let results = [];
-
-            for (let i = 0; i < context.challenges.length; i++) {
-              (function(ch) {
-                verifyDnsChallenge(ch.domain, ch.value, function(err, found) {
-                  if (context.aborted) return;
-
-                  if (found === true) ok_count++;
-                  results.push({ domain: ch.domain, found: !!found });
-                  checked++;
-
-                  if (checked >= total) {
-                    context.verify_attempt++;
-
-                    ev.emit('verify', {
-                      attempt: context.verify_attempt,
-                      total: context.autoVerifyRetries,
-                      found: ok_count,
-                      expected: total,
-                      results: results,
-                    });
-
-                    if (ok_count >= total) {
-                      if (context.verify_timer) {
-                        clearInterval(context.verify_timer);
-                        context.verify_timer = null;
-                      }
-                      set_context({ all_verified: true, state: 'completing' });
-                    } else if (context.verify_attempt >= context.autoVerifyRetries) {
-                      if (context.verify_timer) {
-                        clearInterval(context.verify_timer);
-                        context.verify_timer = null;
-                      }
-                      ev.emit('error', new Error('Challenge verification failed after ' + context.autoVerifyRetries + ' attempts'), 'verify');
-                    }
-                  }
-                });
-              })(context.challenges[i]);
-            }
+        let verifyRound = function() {
+          if (context.aborted || context.state !== 'verifying') {
+            context._verify_running = false;
+            return;
           }
 
-          doVerify();
-          context.verify_timer = setInterval(doVerify, context.autoVerifyInterval);
-        }
+          let total = context.challenges.length;
+          let ok_count = 0;
+          let checked = 0;
+          let results = [];
+
+          if (total === 0) {
+            context._verify_running = false;
+            set_context({ all_verified: true, state: 'completing' });
+            return;
+          }
+
+          for (let i = 0; i < context.challenges.length; i++) {
+            (function(ch) {
+              verifyDnsChallenge(ch.domain, ch.value, function(err, found) {
+                if (context.aborted) { context._verify_running = false; return; }
+
+                if (found === true) ok_count++;
+                results.push({ domain: ch.domain, found: !!found });
+                checked++;
+
+                if (checked >= total) {
+                  context.verify_attempt++;
+
+                  ev.emit('verify', {
+                    attempt: context.verify_attempt,
+                    total: context.autoVerifyRetries,
+                    found: ok_count,
+                    expected: total,
+                    results: results,
+                  });
+
+                  if (ok_count >= total) {
+                    context._verify_running = false;
+                    set_context({ all_verified: true, state: 'completing' });
+                  } else if (context.verify_attempt >= context.autoVerifyRetries) {
+                    context._verify_running = false;
+                    emitError(new Error('Challenge verification failed after ' + context.autoVerifyRetries + ' attempts (call done.retry() after fixing DNS)'), 'verify');
+                  } else {
+                    // Schedule next round only after this one fully completed
+                    context.verify_timer = setTimeout(verifyRound, context.autoVerifyInterval);
+                  }
+                }
+              });
+            })(context.challenges[i]);
+          }
+        };
+
+        verifyRound();
       }
 
 
@@ -598,6 +730,7 @@ function Order(options) {
         } else {
           let submit_left = selected.length;
           let submit_results = [];
+          let submit_errors = [];
 
           for (let i = 0; i < selected.length; i++) {
             (function(ch) {
@@ -612,13 +745,19 @@ function Order(options) {
                   error: err ? err.message : null,
                 };
                 submit_results.push(result);
-
-                if (err) { ev.emit('error', err, 'challenge'); }
+                if (err) submit_errors.push(ch.identifier.value + ': ' + err.message);
 
                 submit_left--;
                 if (submit_left <= 0) {
                   ev.emit('completing', { results: submit_results });
-                  set_context({ challenges_submitted: true, state: 'validating' });
+
+                  if (submit_errors.length > 0) {
+                    // Emit ONE error after the whole batch — emitting mid-loop
+                    // would wedge the state machine while requests are in flight
+                    emitError(new Error('Failed to submit ' + submit_errors.length + '/' + selected.length + ' challenges: ' + submit_errors.join('; ')), 'challenge');
+                  } else {
+                    set_context({ challenges_submitted: true, state: 'validating' });
+                  }
                 }
               });
             })(selected[i]);
@@ -629,91 +768,116 @@ function Order(options) {
 
       // --- STATE: validating — poll challenge URLs until all valid ---
 
-      if (context.state === 'validating' && context.challenges_submitted === true && context.all_authorizations_valid === false) {
+      if (context.state === 'validating' && context.challenges_submitted === true && context.all_authorizations_valid === false && context._validating_running === false) {
 
-        if (context.validating_timer === null) {
-          context.validating_attempt = 0;
+        context._validating_running = true;
+        context.validating_attempt = 0;
 
-          // All challenge URLs — each is unique
-          let challenge_urls = [];
-          for (let i = 0; i < context.challenges.length; i++) {
-            challenge_urls.push({ url: context.challenges[i].url, identifier: context.challenges[i].identifier.value });
-          }
+        // All challenge URLs — each is unique
+        let challenge_urls = [];
+        for (let i = 0; i < context.challenges.length; i++) {
+          challenge_urls.push({ url: context.challenges[i].url, identifier: context.challenges[i].identifier.value });
+        }
 
-          function doValidate() {
-            if (context.aborted) return;
+        if (challenge_urls.length === 0) {
+          // Nothing to validate (all authorizations were already valid)
+          context._validating_running = false;
+          set_context({ all_authorizations_valid: true, state: 'ready' });
+        } else {
+
+          let validateRound = function() {
+            if (context.aborted || context.state !== 'validating') {
+              context._validating_running = false;
+              return;
+            }
 
             let total = challenge_urls.length;
             let valid_count = 0;
             let checked = 0;
+            let invalid = false;
             let statuses = [];
 
             for (let i = 0; i < challenge_urls.length; i++) {
               (function(ch_info) {
                 // POST-as-GET to challenge URL (same as acme-client waitForValidStatus)
                 context.http.signedRequest(ch_info.url, '', context.accountKey, context.account_url, function(err, res) {
-                  if (context.aborted) return;
+                  if (context.aborted) { context._validating_running = false; return; }
 
                   let status = (err ? 'error' : (res.json ? res.json.status : 'unknown'));
                   statuses.push(ch_info.identifier + ':' + status);
 
                   if (status === 'valid') valid_count++;
-                  if (status === 'invalid') {
-                    if (context.validating_timer) { clearInterval(context.validating_timer); context.validating_timer = null; }
-                    ev.emit('error', new Error('Challenge invalid: ' + JSON.stringify(res.json)), 'challenge');
+                  if (status === 'invalid' && invalid === false) {
+                    invalid = true;
+                    context._validating_running = false;
+                    emitError(new Error('Challenge invalid: ' + JSON.stringify(res.json)), 'challenge');
                   }
                   checked++;
 
-                  if (checked >= total) {
+                  if (checked >= total && invalid === false) {
                     context.validating_attempt++;
                     ev.emit('validating', { attempt: context.validating_attempt, statuses: statuses });
 
                     if (valid_count >= total) {
-                      if (context.validating_timer) { clearInterval(context.validating_timer); context.validating_timer = null; }
+                      context._validating_running = false;
                       set_context({ all_authorizations_valid: true, state: 'ready' });
-                    } else if (context.validating_attempt >= 30) {
-                      if (context.validating_timer) { clearInterval(context.validating_timer); context.validating_timer = null; }
-                      ev.emit('error', new Error('CA validation timed out. Statuses: ' + statuses.join(', ')), 'challenge');
+                    } else if (context.validating_attempt >= context.validatingRetries) {
+                      context._validating_running = false;
+                      emitError(new Error('CA validation timed out. Statuses: ' + statuses.join(', ')), 'challenge');
+                    } else {
+                      context.validating_timer = setTimeout(validateRound, context.validatingInterval);
                     }
                   }
                 });
               })(challenge_urls[i]);
             }
-          }
+          };
 
-          doValidate();
-          context.validating_timer = setInterval(doValidate, 3000);
+          validateRound();
         }
       }
 
 
       // --- STATE: ready — poll order until status "ready" ---
 
-      if (context.state === 'ready' && context.all_authorizations_valid === true && context.order_ready === false) {
+      if (context.state === 'ready' && context.all_authorizations_valid === true && context.order_ready === false && context._ready_running === false) {
 
-        if (context.ready_timer === null) {
+        context._ready_running = true;
 
-          function doCheckReady() {
-            if (context.aborted) return;
-
-            context.http.signedRequest(context.order_url, '', context.accountKey, context.account_url, function(err, res) {
-              if (context.aborted) return;
-
-              let status = (err ? 'error' : (res.json ? res.json.status : 'unknown'));
-
-              if (status === 'ready' || status === 'valid') {
-                if (context.ready_timer) { clearInterval(context.ready_timer); context.ready_timer = null; }
-                set_context({ order_ready: true, state: 'finalizing' });
-              } else if (status === 'invalid') {
-                if (context.ready_timer) { clearInterval(context.ready_timer); context.ready_timer = null; }
-                ev.emit('error', new Error('Order invalid: ' + JSON.stringify(res.json)), 'finalize');
-              }
-            });
+        let readyRound = function() {
+          if (context.aborted || context.state !== 'ready') {
+            context._ready_running = false;
+            return;
           }
 
-          doCheckReady();
-          context.ready_timer = setInterval(doCheckReady, 2000);
-        }
+          context.http.signedRequest(context.order_url, '', context.accountKey, context.account_url, function(err, res) {
+            if (context.aborted) { context._ready_running = false; return; }
+
+            let status = (err ? 'error' : (res.json ? res.json.status : 'unknown'));
+
+            if (status === 'valid' && res.json.certificate) {
+              // Order is already valid — finalizing it again would fail
+              // (orderNotReady). Jump straight to certificate download.
+              context._ready_running = false;
+              set_context({
+                order_ready: true,
+                order_finalized: true,
+                certificate_url: res.json.certificate,
+                state: 'certificate',
+              });
+            } else if (status === 'ready') {
+              context._ready_running = false;
+              set_context({ order_ready: true, state: 'finalizing' });
+            } else if (status === 'invalid') {
+              context._ready_running = false;
+              emitError(new Error('Order invalid: ' + JSON.stringify(res.json)), 'finalize');
+            } else {
+              context.ready_timer = setTimeout(readyRound, retryAfterDelay(res, 2000));
+            }
+          });
+        };
+
+        readyRound();
       }
 
 
@@ -724,7 +888,7 @@ function Order(options) {
 
         context.http.signedRequest(context.finalize_url, { csr: base64url(context.csr) }, context.accountKey, context.account_url, function(err, res) {
           if (context.aborted) return;
-          if (err) { ev.emit('error', err, 'finalize'); return; }
+          if (err) { emitError(err, 'finalize'); return; }
 
           if (res.status === 200 || res.status === 201) {
             let cert_url = (res.json && res.json.certificate) || null;
@@ -735,7 +899,7 @@ function Order(options) {
               set_context({ order_finalized: true, state: 'processing' });
             }
           } else {
-            ev.emit('error', new Error('Finalize failed: HTTP ' + res.status + ' ' + JSON.stringify(res.json)), 'finalize');
+            emitError(new Error('Finalize failed: HTTP ' + res.status + ' ' + JSON.stringify(res.json)), 'finalize');
           }
         });
       }
@@ -743,30 +907,33 @@ function Order(options) {
 
       // --- STATE: processing — poll order until "valid" + certificate URL ---
 
-      if (context.state === 'processing' && context.order_finalized === true && context.certificate_url === null) {
+      if (context.state === 'processing' && context.order_finalized === true && context.certificate_url === null && context._processing_running === false) {
 
-        if (context.processing_timer === null) {
+        context._processing_running = true;
 
-          function doCheckProcessing() {
-            if (context.aborted) return;
-
-            context.http.signedRequest(context.order_url, '', context.accountKey, context.account_url, function(err, res) {
-              if (context.aborted) return;
-              if (err) return;
-
-              if (res.json && res.json.status === 'valid' && res.json.certificate) {
-                if (context.processing_timer) { clearInterval(context.processing_timer); context.processing_timer = null; }
-                set_context({ certificate_url: res.json.certificate, state: 'certificate' });
-              } else if (res.json && res.json.status === 'invalid') {
-                if (context.processing_timer) { clearInterval(context.processing_timer); context.processing_timer = null; }
-                ev.emit('error', new Error('Order invalid: ' + JSON.stringify(res.json)), 'certificate');
-              }
-            });
+        let processingRound = function() {
+          if (context.aborted || context.state !== 'processing') {
+            context._processing_running = false;
+            return;
           }
 
-          doCheckProcessing();
-          context.processing_timer = setInterval(doCheckProcessing, 2000);
-        }
+          context.http.signedRequest(context.order_url, '', context.accountKey, context.account_url, function(err, res) {
+            if (context.aborted) { context._processing_running = false; return; }
+
+            if (!err && res.json && res.json.status === 'valid' && res.json.certificate) {
+              context._processing_running = false;
+              set_context({ certificate_url: res.json.certificate, state: 'certificate' });
+            } else if (!err && res.json && res.json.status === 'invalid') {
+              context._processing_running = false;
+              emitError(new Error('Order invalid: ' + JSON.stringify(res.json)), 'certificate');
+            } else {
+              // Transient error or still processing — keep polling
+              context.processing_timer = setTimeout(processingRound, retryAfterDelay(err ? null : res, 2000));
+            }
+          });
+        };
+
+        processingRound();
       }
 
 
@@ -777,7 +944,7 @@ function Order(options) {
 
         context.http.signedRequest(context.certificate_url, '', context.accountKey, context.account_url, function(err, res) {
           if (context.aborted) return;
-          if (err) { ev.emit('error', err, 'certificate'); return; }
+          if (err) { emitError(err, 'certificate'); return; }
 
           if (res.status === 200) {
             let cert_pem = res.body.toString('utf8');
@@ -789,14 +956,14 @@ function Order(options) {
               cert: pems[0] || cert_pem,
               ca: pems.length > 1 ? pems.slice(1) : [],
               key: context.privateKey,
-              csr: pemEncodeCsr(context.csr),
+              csr: pemEncode(context.csr, 'CERTIFICATE REQUEST'),
               expiresAt: extractExpiry(pems[0] || cert_pem),
             };
 
             set_context({ cert: cert_obj, cert_fetched: true });
             ev.emit('certificate', cert_obj);
           } else {
-            ev.emit('error', new Error('Certificate download failed: HTTP ' + res.status), 'certificate');
+            emitError(new Error('Certificate download failed: HTTP ' + res.status), 'certificate');
           }
         });
       }
@@ -811,6 +978,21 @@ function Order(options) {
   }
 
 
+  /**
+   * Compute polling delay from a Retry-After header (RFC 8555 recommends
+   * clients respect it). Falls back to default_ms; capped at 2 minutes.
+   */
+  function retryAfterDelay(res, default_ms) {
+    if (res && res.headers && res.headers['retry-after']) {
+      let ra = parseInt(res.headers['retry-after'], 10);
+      if (!isNaN(ra) && ra > 0) {
+        return Math.min(ra * 1000, 120000);
+      }
+    }
+    return default_ms;
+  }
+
+
   function splitPemChain(pem) {
     let certs = [];
     let parts = pem.split('-----BEGIN CERTIFICATE-----');
@@ -818,17 +1000,6 @@ function Order(options) {
       certs.push('-----BEGIN CERTIFICATE-----' + parts[i].split('-----END CERTIFICATE-----')[0] + '-----END CERTIFICATE-----\n');
     }
     return certs;
-  }
-
-
-  function pemEncodeCsr(der) {
-    if (typeof der === 'string') return der;
-    let b64 = Buffer.from(der).toString('base64');
-    let lines = [];
-    for (let i = 0; i < b64.length; i += 64) {
-      lines.push(b64.substring(i, i + 64));
-    }
-    return '-----BEGIN CERTIFICATE REQUEST-----\n' + lines.join('\n') + '\n-----END CERTIFICATE REQUEST-----\n';
   }
 
 
@@ -853,6 +1024,33 @@ function Order(options) {
 
     start: function() {
       if (context.aborted) return;
+
+      // Validate upfront — a missing email would otherwise surface as a
+      // cryptic 'mailto:null' rejection from the CA, deep into the flow.
+      let problems = [];
+      if (!context.domain) problems.push('domain is required');
+      if (!context.email) problems.push('email is required');
+      if (context.provider === 'zerossl' && !(context.eab && context.eab.kid && context.eab.hmacKey)) {
+        problems.push('ZeroSSL requires eab: { kid, hmacKey }');
+      }
+      if (options.accountUrl && !options.accountKey) {
+        problems.push('accountUrl requires accountKey (the key that registered that account)');
+      }
+      let provider_info = PROVIDERS[context.provider];
+      if (!provider_info) {
+        problems.push('unknown provider: ' + context.provider);
+      } else if (context.staging && !provider_info.staging) {
+        problems.push("provider '" + context.provider + "' has no staging environment");
+      }
+
+      if (problems.length > 0) {
+        // Async so listeners attached right after start() still catch it
+        process.nextTick(function() {
+          emitError(new Error('Invalid options: ' + problems.join('; ')), 'options');
+        });
+        return;
+      }
+
       if (context.preflight) {
         set_context({ state: 'preflight' });
       } else {
@@ -862,13 +1060,8 @@ function Order(options) {
 
     abort: function() {
       let step = context.state;
-      let timers = ['verify_timer', 'validating_timer', 'ready_timer', 'processing_timer'];
-      for (let i = 0; i < timers.length; i++) {
-        if (context[timers[i]]) {
-          clearInterval(context[timers[i]]);
-          context[timers[i]] = null;
-        }
-      }
+      clearAllTimers();
+      clearProgressFlags();
       set_context({ aborted: true, state: 'aborted' });
       ev.emit('abort', step);
     },
@@ -877,7 +1070,10 @@ function Order(options) {
     getDomain: function() { return context.domain; },
     getAccountKey: function() { return context.accountKey; },
     getPrivateKey: function() { return context.privateKey; },
-    getCsr: function() { return context.csr; },
+    getCsr: function() { return context.csr; },                    // DER (Uint8Array) — or whatever was provided
+    getCsrPem: function() {
+      return context.csr ? pemEncode(context.csr, 'CERTIFICATE REQUEST') : null;
+    },
   };
 
 

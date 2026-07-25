@@ -9,9 +9,15 @@ import { signJws, getJwk } from './crypto.js';
  * Fetch a URL.
  * callback(err, { status, headers, body, json })
  */
-function httpRequest(url, method, headers, body, callback) {
+function httpRequest(url, method, headers, body, callback, options) {
+  options = options || {};
+  let timeout = options.timeout || 30000;
+
   let parsed = new URL(url);
   let mod = parsed.protocol === 'https:' ? https : http;
+
+  // Clone — never mutate the caller's headers object, and tolerate null
+  headers = Object.assign({}, headers || {});
 
   // RFC 8555 §6.1: ACME clients MUST send a User-Agent header
   if (!headers['User-Agent'] && !headers['user-agent']) {
@@ -23,8 +29,16 @@ function httpRequest(url, method, headers, body, callback) {
     port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
     path: parsed.pathname + parsed.search,
     method: method || 'GET',
-    headers: headers || {},
+    headers: headers,
   };
+
+  // Guard against double callback (timeout destroy + error event)
+  let finished = false;
+  function finish(err, res) {
+    if (finished) return;
+    finished = true;
+    callback(err, res);
+  }
 
   let req = mod.request(opts, function(res) {
     let chunks = [];
@@ -45,11 +59,16 @@ function httpRequest(url, method, headers, body, callback) {
         } catch(e) {}
       }
 
-      callback(null, result);
+      finish(null, result);
     });
   });
 
-  req.on('error', function(err) { callback(err); });
+  req.on('error', function(err) { finish(err); });
+
+  // Abort requests that hang — a stuck socket must never block the flow forever
+  req.setTimeout(timeout, function() {
+    req.destroy(new Error('Request timed out after ' + timeout + 'ms: ' + method + ' ' + url));
+  });
 
   if (body) {
     req.write(body);
@@ -62,13 +81,17 @@ function httpRequest(url, method, headers, body, callback) {
  * ACME HTTP Client.
  * All methods use callback(err, result) pattern.
  */
-function AcmeHttp(directory_url) {
-  if (!(this instanceof AcmeHttp)) return new AcmeHttp(directory_url);
+function AcmeHttp(directory_url, options) {
+  if (!(this instanceof AcmeHttp)) return new AcmeHttp(directory_url, options);
+  options = options || {};
 
   let self = this;
 
   let directory = null;
   let nonce = null;
+
+  let http_opts = { timeout: options.timeout || 30000 };
+  let max_nonce_retries = options.maxNonceRetries || 3;
 
 
   /**
@@ -84,7 +107,7 @@ function AcmeHttp(directory_url) {
       if (res.headers['replay-nonce']) nonce = res.headers['replay-nonce'];
 
       callback(null, directory);
-    });
+    }, http_opts);
   };
 
 
@@ -106,15 +129,20 @@ function AcmeHttp(directory_url) {
     httpRequest(directory.newNonce, 'HEAD', {}, null, function(err, res) {
       if (err) return callback(err);
       callback(null, res.headers['replay-nonce'] || null);
-    });
+    }, http_opts);
   };
 
 
   /**
    * Signed POST request to an ACME endpoint.
+   * Retries on badNonce (RFC 8555 §6.5) up to max_nonce_retries times — never infinitely.
    * callback(err, res)
    */
   self.signedRequest = function(url, payload, account_key_pem, account_url, callback) {
+    signedAttempt(url, payload, account_key_pem, account_url, 0, callback);
+  };
+
+  function signedAttempt(url, payload, account_key_pem, account_url, attempt, callback) {
     self.getNonce(function(err, current_nonce) {
       if (err) return callback(err);
 
@@ -144,16 +172,19 @@ function AcmeHttp(directory_url) {
           nonce = res.headers['replay-nonce'];
         }
 
-        // Handle badNonce — retry once (RFC 8555 §6.5)
+        // Handle badNonce — bounded retry (a broken CA must not cause an infinite loop)
         if (res.status === 400 && res.json && res.json.type === 'urn:ietf:params:acme:error:badNonce') {
           nonce = res.headers['replay-nonce'] || null;
-          return self.signedRequest(url, payload, account_key_pem, account_url, callback);
+          if (attempt >= max_nonce_retries) {
+            return callback(new Error('badNonce persisted after ' + max_nonce_retries + ' retries: ' + url));
+          }
+          return signedAttempt(url, payload, account_key_pem, account_url, attempt + 1, callback);
         }
 
         callback(null, res);
-      });
+      }, http_opts);
     });
-  };
+  }
 
 
   self.getUrl = function(resource) {

@@ -27,8 +27,27 @@ function Manager(options) {
   let check_timer = null;
   let current = null;
   let current_order = null;
+  let current_timeout = null;   // per-domain 10-min timeout — module scope so stop() can clear it
+  let stopped = false;          // stop() sets this; finish() must not reschedule afterwards
+  let scanning = false;         // guards checkAll against overlapping async scans
 
   let CSV_HEADER = 'domain,status,issued_at,expires_at,renew_after,last_attempt,last_error';
+
+
+  // Emit 'error' safely — a bare EventEmitter 'error' with no listener
+  // crashes the process
+  function emitError(domain, err) {
+    if (ev.listenerCount('error') > 0) {
+      ev.emit('error', domain, err);
+    } else {
+      console.error('[cert-manager] unhandled manager error for "' + domain + '":', err && err.message ? err.message : err);
+    }
+  }
+
+  // Strip characters that would corrupt the CSV structure
+  function csvSafe(value) {
+    return String(value == null ? '' : value).replace(/[\r\n]+/g, ' ');
+  }
 
 
   // --- File paths ---
@@ -51,13 +70,19 @@ function Manager(options) {
   }
 
   function rowToCsv(r) {
-    return [r.domain, r.status, r.issued_at || '', r.expires_at || '',
-      r.renew_after || '', r.last_attempt || '', r.last_error || ''].join(',');
+    return [csvSafe(r.domain), csvSafe(r.status), csvSafe(r.issued_at), csvSafe(r.expires_at),
+      csvSafe(r.renew_after), csvSafe(r.last_attempt), csvSafe(r.last_error)].join(',');
   }
 
   function readCsv(callback) {
     fs.readFile(csvPath(), 'utf8', function(err, data) {
-      if (err) return callback(null, []);
+      if (err) {
+        // Only ENOENT means "no data yet". Any other error (EBUSY, EACCES...)
+        // must propagate — treating it as an empty list would let a later
+        // writeCsv() silently wipe every row.
+        if (err.code === 'ENOENT') return callback(null, []);
+        return callback(err, null);
+      }
       let lines = data.trim().split('\n');
       let rows = [];
       for (let i = 1; i < lines.length; i++) {
@@ -69,13 +94,26 @@ function Manager(options) {
   }
 
   function writeCsv(rows, callback) {
+    callback = callback || function() {};
     let lines = [CSV_HEADER];
     for (let i = 0; i < rows.length; i++) lines.push(rowToCsv(rows[i]));
-    fs.writeFile(csvPath(), lines.join('\n') + '\n', callback || function() {});
+
+    // Atomic write: temp file + rename, so a crash mid-write can never
+    // leave a half-written certificates.csv
+    let tmp = csvPath() + '.tmp';
+    fs.writeFile(tmp, lines.join('\n') + '\n', function(err) {
+      if (err) return callback(err);
+      fs.rename(tmp, csvPath(), callback);
+    });
   }
 
   function updateCsvRow(domain, updates, callback) {
     readCsv(function(err, rows) {
+      if (err) {
+        // Refuse to write over data we could not read
+        if (callback) callback(err);
+        return;
+      }
       for (let i = 0; i < rows.length; i++) {
         if (rows[i].domain === domain) {
           for (let k in updates) rows[i][k] = updates[k];
@@ -139,6 +177,7 @@ function Manager(options) {
   // --- Timer ---
 
   function scheduleCheck(delay) {
+    if (stopped) return;
     if (check_timer) { clearTimeout(check_timer); check_timer = null; }
     check_timer = setTimeout(checkAll, delay);
   }
@@ -147,6 +186,7 @@ function Manager(options) {
   // --- Process single domain ---
 
   function processDomain(domain) {
+    if (stopped) { current = null; return; }
     loadCert(domain, function(err, domainConfig) {
       domainConfig = domainConfig || {};
       loadAccount(function(err2, account) {
@@ -162,9 +202,14 @@ function Manager(options) {
           autoVerify: true,
         };
 
-        if (account && account.key) orderOpts.accountKey = account.key;
+        if (account && account.key) {
+          orderOpts.accountKey = account.key;
+          // Known account URL — Order skips the newAccount round-trip entirely
+          if (account.url) orderOpts.accountUrl = account.url;
+        }
 
         readCsv(function(err3, rows) {
+          if (err3 || !rows) rows = [];
           let daysLeft = null;
           for (let i = 0; i < rows.length; i++) {
             if (rows[i].domain === domain && rows[i].expires_at) {
@@ -177,21 +222,29 @@ function Manager(options) {
 
           updateCsvRow(domain, { last_attempt: new Date().toISOString() }, function() {
 
-            let timeout_timer = null;
+            // stop() may have been called during the async chain above —
+            // never create an orphan order after shutdown
+            if (stopped) { current = null; return; }
+
+            let finished = false;
 
             function finish() {
-              if (timeout_timer) { clearTimeout(timeout_timer); timeout_timer = null; }
+              if (finished) return;
+              finished = true;
+              if (current_timeout) { clearTimeout(current_timeout); current_timeout = null; }
               current = null;
               current_order = null;
-              scheduleCheck(100);
+              // After stop(), never reschedule — this orphaned path used to
+              // silently resurrect the manager
+              if (!stopped) scheduleCheck(100);
             }
 
             current_order = new Order(orderOpts);
 
-            timeout_timer = setTimeout(function() {
+            current_timeout = setTimeout(function() {
               if (current_order) current_order.abort();
               updateCsvRow(domain, { status: 'error', last_error: 'timeout' });
-              ev.emit('error', domain, new Error('Renewal timed out'));
+              emitError(domain, new Error('Renewal timed out'));
               finish();
             }, 1000 * 60 * 10);
 
@@ -226,8 +279,8 @@ function Manager(options) {
             });
 
             current_order.on('error', function(err, step) {
-              updateCsvRow(domain, { status: 'error', last_error: err.message.substring(0, 100) }, function() {
-                ev.emit('error', domain, err);
+              updateCsvRow(domain, { status: 'error', last_error: (err.message || '').substring(0, 100) }, function() {
+                emitError(domain, err);
                 finish();
               });
             });
@@ -244,10 +297,16 @@ function Manager(options) {
 
   function checkAll() {
     check_timer = null;
-    if (current !== null) { scheduleCheck(config.checkInterval); return; }
+    if (stopped) return;
+
+    // The 'scanning' flag is taken synchronously BEFORE the async read.
+    // Without it, add() calling checkAll() while a scheduled scan is mid-read
+    // let two scans pass the `current` guard and start two parallel orders.
+    if (current !== null || scanning) { scheduleCheck(config.checkInterval); return; }
+    scanning = true;
 
     fs.readFile(csvPath(), 'utf8', function(err, data) {
-      if (err || !data) { scheduleCheck(config.checkInterval); return; }
+      if (err || !data) { scanning = false; scheduleCheck(config.checkInterval); return; }
 
       let now = new Date();
       let today = now.toISOString().split('T')[0];
@@ -257,7 +316,7 @@ function Manager(options) {
       let scan_done = false;
 
       function onScanComplete() {
-        if (candidates.length === 0) { scheduleCheck(config.checkInterval); return; }
+        if (candidates.length === 0) { scanning = false; scheduleCheck(config.checkInterval); return; }
 
         candidates.sort(function(a, b) {
           if (!a.last_attempt && !b.last_attempt) return 0;
@@ -267,6 +326,7 @@ function Manager(options) {
         });
 
         current = candidates[0].domain;
+        scanning = false;
         processDomain(candidates[0].domain);
       }
 
@@ -329,24 +389,39 @@ function Manager(options) {
       ensureDir(function() {
         opts = opts || {};
         readCsv(function(err, rows) {
+          if (err) { emitError(domain, err); return; }
           for (let i = 0; i < rows.length; i++) {
             if (rows[i].domain === domain) return;
           }
-          saveCert(domain, {
-            domain: domain, wildcard: !!opts.wildcard, email: opts.email || config.email,
-          }, function() {
-            rows.push({
-              domain: domain, status: 'pending', issued_at: '', expires_at: '',
-              renew_after: '', last_attempt: '', last_error: '',
+          // Merge with any existing cert JSON — never clobber a stored
+          // certificate just because the CSV row went missing
+          loadCert(domain, function(e2, existing) {
+            let data = existing || {};
+            data.domain = domain;
+            data.wildcard = !!opts.wildcard;
+            data.email = opts.email || config.email;
+
+            saveCert(domain, data, function() {
+              rows.push({
+                domain: domain, status: 'pending', issued_at: '', expires_at: '',
+                renew_after: '', last_attempt: '', last_error: '',
+              });
+              writeCsv(rows, function() { checkAll(); });
             });
-            writeCsv(rows, function() { checkAll(); });
           });
         });
       });
     },
 
     remove: function(domain) {
+      // If this domain is being processed right now, abort it first
+      if (current === domain) {
+        if (current_order) { current_order.abort(); current_order = null; }
+        if (current_timeout) { clearTimeout(current_timeout); current_timeout = null; }
+        current = null;
+      }
       readCsv(function(err, rows) {
+        if (err || !rows) return;
         let filtered = [];
         for (let i = 0; i < rows.length; i++) {
           if (rows[i].domain !== domain) filtered.push(rows[i]);
@@ -378,23 +453,29 @@ function Manager(options) {
     list: function(callback) { readCsv(callback); },
 
     renewNow: function(domain) {
-      if (current !== null) return;
+      if (stopped) return false;
+      if (current !== null) return false;
       current = domain;
       processDomain(domain);
+      return true;
     },
 
     status: function() { return current; },
 
     start: function() {
+      stopped = false;
       ensureDir(function() {
         if (check_timer === null) checkAll();
       });
     },
 
     stop: function() {
+      stopped = true;
       if (check_timer) { clearTimeout(check_timer); check_timer = null; }
+      if (current_timeout) { clearTimeout(current_timeout); current_timeout = null; }
       if (current_order) { current_order.abort(); current_order = null; }
       current = null;
+      scanning = false;
     },
   };
 

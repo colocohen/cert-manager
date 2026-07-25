@@ -10,6 +10,8 @@ import {
   signJws,
   signEab,
   base64url,
+  pemEncode,
+  toAsciiDomain,
 } from './src/crypto.js';
 import { AcmeHttp } from './src/http.js';
 import {
@@ -30,7 +32,7 @@ function manager(options) {
 /**
  * Crypto primitives for advanced consumers.
  */
-var crypto = {
+const crypto = {
   generateKey,
   getJwk,
   getJwkThumbprint,
@@ -38,13 +40,15 @@ var crypto = {
   signJws,
   signEab,
   base64url,
+  pemEncode,
+  toAsciiDomain,
 };
 
 
 /**
  * Verification utilities.
  */
-var verify = {
+const verify = {
   verifyDnsChallenge,
   checkCaa,
 };
