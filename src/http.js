@@ -25,7 +25,11 @@ function httpRequest(url, method, headers, body, callback, options) {
   }
 
   let opts = {
-    hostname: parsed.hostname,
+    // WHATWG URL keeps IPv6 brackets in .hostname ('[2a02::1]') — but
+    // net.connect/http.request need the bare address, otherwise the literal
+    // bracketed string goes to DNS and fails with ENOTFOUND. This silently
+    // broke every IPv6 http-01 self-check.
+    hostname: parsed.hostname.replace(/^\[|\]$/g, ''),
     port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
     path: parsed.pathname + parsed.search,
     method: method || 'GET',

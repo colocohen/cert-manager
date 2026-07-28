@@ -12,10 +12,15 @@ import {
   base64url,
   pemEncode,
   toAsciiDomain,
+  ipToBytes,
+  ipToArpa,
+  createAlpnCertificate,
+  getAriCertId,
 } from './src/crypto.js';
 import { AcmeHttp } from './src/http.js';
 import {
   verifyDnsChallenge,
+  verifyHttpChallenge,
   checkCaa,
 } from './src/verify.js';
 
@@ -42,6 +47,10 @@ const crypto = {
   base64url,
   pemEncode,
   toAsciiDomain,
+  ipToBytes,
+  ipToArpa,
+  createAlpnCertificate,
+  getAriCertId,
 };
 
 
@@ -50,6 +59,7 @@ const crypto = {
  */
 const verify = {
   verifyDnsChallenge,
+  verifyHttpChallenge,
   checkCaa,
 };
 

@@ -1,9 +1,10 @@
 
 import { EventEmitter } from 'node:events';
 import * as nodeCrypto from 'node:crypto';
+import * as net from 'node:net';
 import { AcmeHttp } from './http.js';
-import { generateKey, getJwk, getJwkThumbprint, createCsr, signJws, signEab, base64url, pemEncode, toAsciiDomain } from './crypto.js';
-import { verifyDnsChallenge, checkCaa } from './verify.js';
+import { generateKey, getJwk, getJwkThumbprint, createCsr, signJws, signEab, base64url, pemEncode, toAsciiDomain, ipToArpa, canonicalIp, createAlpnCertificate, getCertDates } from './crypto.js';
+import { verifyDnsChallenge, verifyHttpChallenge, checkCaa } from './verify.js';
 import { PROVIDERS } from './providers.js';
 
 
@@ -28,6 +29,20 @@ function Order(options) {
     accountUrl: options.accountUrl || null,  // known account URL — skips newAccount round-trip
     privateKey: options.privateKey || null,
     csr: options.csr || null,
+
+    // Challenge type: 'dns-01' (default) | 'http-01' | 'tls-alpn-01'.
+    // dns-01 is forbidden for IP identifiers (RFC 8738) — validated in start().
+    challengeType: options.challengeType || 'dns-01',
+
+    // ACME certificate profile (draft-ietf-acme-profiles), e.g. 'shortlived'.
+    // Auto-set to 'shortlived' for IP orders on Let's Encrypt (policy requirement).
+    profile: options.profile || null,
+
+    // ARI (RFC 9773 §5): certificate id (from getAriCertId) of the cert this
+    // order replaces. Renewals inside the ARI window with a valid `replaces`
+    // are exempt from Let's Encrypt rate limits.
+    replaces: options.replaces || null,
+    _replaces_retried: false,
 
     // EAB (External Account Binding) for ZeroSSL etc.
     eab: options.eab || null,  // { kid: '...', hmacKey: '...' }
@@ -106,6 +121,7 @@ function Order(options) {
 
     http: null,
     directory_loaded: false,
+    _profile_checked: false,
 
     _completing_in_progress: false,
     _finalizing_in_progress: false,
@@ -172,26 +188,44 @@ function Order(options) {
   }
 
 
+  // { type: 'dns' | 'ip', value } — RFC 8555 §9.7.7 + RFC 8738 §3
+  function toIdentifier(value) {
+    if (net.isIP(value)) {
+      return { type: 'ip', value: value };
+    }
+    return { type: 'dns', value: toAsciiDomain(value) };
+  }
+
   function buildIdentifiers() {
     let ids = [];
-    let domain = toAsciiDomain(context.domain);
-    if (domain) {
-      ids.push({ type: 'dns', value: domain });
+    if (context.domain) {
+      ids.push(toIdentifier(context.domain));
     }
-    if (context.wildcard && domain) {
-      ids.push({ type: 'dns', value: '*.' + domain });
+    if (context.wildcard && context.domain) {
+      // wildcard is rejected for IPs in start() before we ever get here
+      ids.push({ type: 'dns', value: '*.' + toAsciiDomain(context.domain) });
     }
     if (context.altNames) {
       for (let i = 0; i < context.altNames.length; i++) {
-        let alt = toAsciiDomain(context.altNames[i]);
+        let id = toIdentifier(context.altNames[i]);
         let found = false;
         for (let j = 0; j < ids.length; j++) {
-          if (ids[j].value === alt) { found = true; break; }
+          if (ids[j].value === id.value) { found = true; break; }
         }
-        if (!found) ids.push({ type: 'dns', value: alt });
+        if (!found) ids.push(id);
       }
     }
     return ids;
+  }
+
+  function hasIpIdentifier() {
+    if (context.domain && net.isIP(context.domain)) return true;
+    if (context.altNames) {
+      for (let i = 0; i < context.altNames.length; i++) {
+        if (net.isIP(context.altNames[i])) return true;
+      }
+    }
+    return false;
   }
 
 
@@ -330,7 +364,24 @@ function Order(options) {
       // --- STATE: preflight ---
 
       if (context.state === 'preflight' && context.preflight_done === false && context._preflight_running === false) {
-        context._preflight_running = true;
+
+        // CAA is a DNS record — it does not exist for IP addresses.
+        // Querying resolveCaa('81.2.3.4') would just climb a meaningless
+        // tree ('3.2.81' → '2.81' → ...) and waste DNS round-trips.
+        //
+        // CRITICAL: this same-pass transition MUST go through params_to_set.
+        // A synchronous nested set_context() here re-enters the state pass
+        // BEFORE this pass's params (freshly generated account/private keys!)
+        // are applied — the nested pass generates a SECOND key pair, computes
+        // the JWK thumbprint from it, and then pass 1's keys overwrite it.
+        // Result: key authorizations signed-for by one key, thumbprinted by
+        // another — every challenge rejected by the CA with a digest mismatch.
+        if (net.isIP(context.domain)) {
+          params_to_set['preflight_done'] = true;
+          params_to_set['preflight_result'] = { caa: { skipped: 'ip-identifier' } };
+        } else {
+          context._preflight_running = true;
+
         let provider_info = PROVIDERS[context.provider] || PROVIDERS.letsencrypt;
         let caa_domain = provider_info.caa || null;
 
@@ -345,6 +396,7 @@ function Order(options) {
 
           set_context({ preflight_done: true, preflight_result: { caa: caa } });
         });
+        }
       }
 
       // preflight done -> load directory
@@ -369,6 +421,25 @@ function Order(options) {
         });
       }
 
+      // --- Validate requested profile against the CA's advertised profiles ---
+      // draft-ietf-acme-profiles: clients SHOULD NOT request a profile that
+      // isn't advertised in directory meta. Failing here turns an opaque
+      // server rejection into an immediate, self-explanatory local error.
+      // If the CA doesn't advertise profiles at all, we send anyway —
+      // servers ignore unknown newOrder fields.
+
+      if (context.directory_loaded === true && context.profile !== null && context._profile_checked === false) {
+        context._profile_checked = true;
+
+        let dir_data = context.http.getDirectoryData();
+        let offered = dir_data && dir_data.meta && dir_data.meta.profiles;
+
+        if (offered && !(context.profile in offered)) {
+          emitError(new Error("Profile '" + context.profile + "' is not offered by this CA. Available profiles: " + Object.keys(offered).join(', ')), 'order');
+        }
+      }
+
+
       // Account already known (accountUrl provided) — skip newAccount entirely
       if (context.state === 'account' && context.directory_loaded === true && context.account_created === true && context.account_url !== null) {
         params_to_set['state'] = 'order';
@@ -378,7 +449,9 @@ function Order(options) {
         context._account_creating = true;
 
         let new_account_url = context.http.getUrl('newAccount');
-        if (new_account_url) {
+        if (!new_account_url) {
+          emitError(new Error("ACME directory has no 'newAccount' URL — not a valid ACME v2 directory?"), 'account');
+        } else {
 
           let payload = {
             termsOfServiceAgreed: true,
@@ -423,9 +496,19 @@ function Order(options) {
         context._order_creating = true;
 
         let new_order_url = context.http.getUrl('newOrder');
-        if (new_order_url) {
+        if (!new_order_url) {
+          emitError(new Error("ACME directory has no 'newOrder' URL — not a valid ACME v2 directory?"), 'order');
+        } else {
 
-          context.http.signedRequest(new_order_url, { identifiers: context.identifiers }, context.accountKey, context.account_url, function(err, res) {
+          let order_payload = { identifiers: context.identifiers };
+          if (context.profile) {
+            order_payload.profile = context.profile;
+          }
+          if (context.replaces) {
+            order_payload.replaces = context.replaces;
+          }
+
+          context.http.signedRequest(new_order_url, order_payload, context.accountKey, context.account_url, function(err, res) {
             if (context.aborted) return;
             if (err) { emitError(err, 'order'); return; }
 
@@ -473,6 +556,15 @@ function Order(options) {
               }
 
               set_context(next);
+            } else if (context.replaces !== null && context._replaces_retried === false) {
+              // A rejected `replaces` (e.g. the old cert was already replaced,
+              // or belongs to another environment) must not block renewal.
+              // Retry ONCE without it — losing the rate-limit exemption is
+              // better than losing the certificate.
+              context._replaces_retried = true;
+              context.replaces = null;
+              context._order_creating = false;
+              set_context({ order_data: null });   // re-trigger the state pass
             } else {
               emitError(new Error('Order creation failed: HTTP ' + res.status + ' ' + JSON.stringify(res.json)), 'order');
             }
@@ -491,8 +583,13 @@ function Order(options) {
         let auth_left = auth_urls.length;
 
         if (auth_left === 0) {
-          set_context({ authorizations_fetched: true, authorizations: [] });
+          // same-pass transition → params_to_set (see preflight comment)
+          context._auths_fetching = false;
+          params_to_set['authorizations_fetched'] = true;
+          params_to_set['authorizations'] = [];
         } else {
+
+          let auth_errors = [];
 
           for (let i = 0; i < auth_urls.length; i++) {
             (function(auth_url) {
@@ -506,14 +603,19 @@ function Order(options) {
                     challenges: res.json.challenges,
                     status: res.json.status,
                   });
+                } else {
+                  auth_errors.push(auth_url + ': ' + (err ? err.message : 'HTTP ' + (res ? res.status : '?')));
                 }
 
                 auth_left--;
                 if (auth_left <= 0) {
-                  if (auth_results.length > 0) {
+                  if (auth_errors.length === 0) {
                     set_context({ authorizations: auth_results, authorizations_fetched: true });
                   } else {
-                    emitError(err || new Error('Failed to fetch authorizations'), 'challenge');
+                    // A PARTIAL fetch must fail loudly. Proceeding with a
+                    // subset would submit fewer challenges than the order
+                    // requires — and then poll a forever-pending order.
+                    emitError(new Error('Failed to fetch ' + auth_errors.length + '/' + auth_urls.length + ' authorizations: ' + auth_errors.join('; ')), 'challenge');
                   }
                 }
               });
@@ -529,6 +631,7 @@ function Order(options) {
 
         let all_challenges = [];
         let had_authorizations = context.authorizations.length > 0;
+        let missing_type = [];
 
         for (let a = 0; a < context.authorizations.length; a++) {
           let auth = context.authorizations[a];
@@ -537,28 +640,60 @@ function Order(options) {
           if (auth.status === 'valid') continue;
           if (!auth.challenges) continue;
 
+          // Pick the challenge matching the configured type
+          let ch = null;
           for (let b = 0; b < auth.challenges.length; b++) {
-            let ch = auth.challenges[b];
-            let key_authorization = ch.token + '.' + context.jwk_thumbprint;
-
-            let challenge_info = {
-              type: ch.type,
-              url: ch.url,
-              token: ch.token,
-              key_authorization: key_authorization,
-              identifier: auth.identifier,
-              auth_url: auth.url,
-            };
-
-            // dns-01 only
-            if (ch.type === 'dns-01') {
-              let hash = nodeCrypto.createHash('sha256').update(key_authorization).digest();
-              challenge_info.domain = '_acme-challenge.' + auth.identifier.value.replace('*.', '');
-              challenge_info.value = base64url(hash);
-              all_challenges.push(challenge_info);
-            }
+            if (auth.challenges[b].type === context.challengeType) { ch = auth.challenges[b]; break; }
           }
+
+          if (!ch) {
+            // The CA decides which challenge types each identifier may use.
+            // Fail with the full picture instead of a silent skip.
+            let offered_types = [];
+            for (let b = 0; b < auth.challenges.length; b++) offered_types.push(auth.challenges[b].type);
+            missing_type.push(auth.identifier.value + ' (offered: ' + offered_types.join(', ') + ')');
+            continue;
+          }
+
+          let key_authorization = ch.token + '.' + context.jwk_thumbprint;
+
+          let challenge_info = {
+            type: ch.type,
+            url: ch.url,
+            token: ch.token,
+            key_authorization: key_authorization,
+            identifier: auth.identifier,
+            auth_url: auth.url,
+          };
+
+          if (ch.type === 'dns-01') {
+            let hash = nodeCrypto.createHash('sha256').update(key_authorization).digest();
+            challenge_info.domain = '_acme-challenge.' + auth.identifier.value.replace('*.', '');
+            challenge_info.value = base64url(hash);
+          } else if (ch.type === 'http-01') {
+            // The CA fetches http://<identifier>/.well-known/acme-challenge/<token>
+            // on port 80 and expects the raw key authorization as the body.
+            // For IP identifiers the Host header will be the IP itself (RFC 8738 §5).
+            challenge_info.path = '/.well-known/acme-challenge/' + ch.token;
+          } else if (ch.type === 'tls-alpn-01') {
+            // RFC 8737: the validation cert carries the SHA-256 digest of the
+            // key authorization (as OCTET STRING, inside the critical
+            // acmeIdentifier extension) — never the key authorization text.
+            let digest = nodeCrypto.createHash('sha256').update(key_authorization).digest();
+            challenge_info.key_authorization_digest = new Uint8Array(digest);
+            // SNI the CA will send: the identifier itself for domains;
+            // the in-addr.arpa / ip6.arpa reverse name for IPs (RFC 8738 §6)
+            challenge_info.sni_name = net.isIP(auth.identifier.value)
+              ? ipToArpa(auth.identifier.value)
+              : auth.identifier.value;
+          }
+
+          all_challenges.push(challenge_info);
         }
+
+        if (missing_type.length > 0) {
+          emitError(new Error("CA offered no '" + context.challengeType + "' challenge for: " + missing_type.join('; ')), 'challenge');
+        } else {
 
         params_to_set['challenges'] = all_challenges;
         params_to_set['challenges_ready'] = true;
@@ -573,53 +708,98 @@ function Order(options) {
           params_to_set['all_authorizations_valid'] = true;
           params_to_set['state'] = 'ready';
         }
+        }
       }
 
 
-      // --- Emit dns event ---
+      // --- Emit challenge event (dns / http / tls-alpn) ---
 
       if (context.challenges_ready === true && context.challenges_emitted === false && context.challenges !== null) {
 
-        let provider_info = PROVIDERS[context.provider] || PROVIDERS.letsencrypt;
-        let caa_domain = provider_info.caa || null;
-
         let records = [];
+        let event_name = 'dns';
 
-        for (let i = 0; i < context.challenges.length; i++) {
-          records.push({
-            type: 'TXT',
-            name: context.challenges[i].domain,
-            value: context.challenges[i].value,
-            required: true,
-          });
-        }
-
-        // CAA records are OPTIONAL: per RFC 8659, absence of CAA means any CA
-        // may issue. These are only a recommendation to restrict issuance —
-        // automation should NOT create them blindly (check record.required).
-        if (caa_domain) {
-          let suggest_caa = true;
-          if (context.preflight_result && context.preflight_result.caa) {
-            if (context.preflight_result.caa.exists === true && context.preflight_result.caa.allowed === true) {
-              suggest_caa = false;
-            }
+        if (context.challengeType === 'http-01') {
+          event_name = 'http';
+          // The consumer must serve keyAuthorization as the plain-text body at
+          // http://<identifier>:80<path> — then call done().
+          for (let i = 0; i < context.challenges.length; i++) {
+            records.push({
+              type: 'http-01',
+              identifier: context.challenges[i].identifier.value,
+              token: context.challenges[i].token,
+              keyAuthorization: context.challenges[i].key_authorization,
+              path: context.challenges[i].path,
+              required: true,
+            });
+          }
+        } else if (context.challengeType === 'tls-alpn-01') {
+          event_name = 'tls-alpn';
+          // The consumer (e.g. a TLS layer like lemon-tls) must present
+          // record.cert/record.key on port 443 when the incoming SNI equals
+          // sniName (the CA offers ALPN 'acme-tls/1' — include it in the
+          // server's ALPN list so negotiation succeeds). Then call done().
+          // The certificate is pre-built per RFC 8737/8738: single-entry SAN
+          // (iPAddress bytes for IPs) + critical acmeIdentifier extension.
+          for (let i = 0; i < context.challenges.length; i++) {
+            let alpn_cert = createAlpnCertificate(
+              context.challenges[i].identifier.value,
+              context.challenges[i].key_authorization
+            );
+            records.push({
+              type: 'tls-alpn-01',
+              identifier: context.challenges[i].identifier.value,
+              token: context.challenges[i].token,
+              keyAuthorization: context.challenges[i].key_authorization,
+              keyAuthorizationDigest: context.challenges[i].key_authorization_digest,
+              sniName: context.challenges[i].sni_name,
+              alpnProtocol: 'acme-tls/1',
+              cert: alpn_cert.cert,
+              key: alpn_cert.key,
+              required: true,
+            });
+          }
+        } else {
+          // dns-01 — unchanged behavior, including optional CAA suggestions
+          for (let i = 0; i < context.challenges.length; i++) {
+            records.push({
+              type: 'TXT',
+              name: context.challenges[i].domain,
+              value: context.challenges[i].value,
+              required: true,
+            });
           }
 
-          if (suggest_caa) {
-            records.push({
-              type: 'CAA',
-              name: context.domain,
-              value: '0 issue "' + caa_domain + '"',
-              required: false,
-            });
+          let provider_info = PROVIDERS[context.provider] || PROVIDERS.letsencrypt;
+          let caa_domain = provider_info.caa || null;
 
-            if (context.wildcard) {
+          // CAA records are OPTIONAL: per RFC 8659, absence of CAA means any CA
+          // may issue. These are only a recommendation to restrict issuance —
+          // automation should NOT create them blindly (check record.required).
+          if (caa_domain) {
+            let suggest_caa = true;
+            if (context.preflight_result && context.preflight_result.caa) {
+              if (context.preflight_result.caa.exists === true && context.preflight_result.caa.allowed === true) {
+                suggest_caa = false;
+              }
+            }
+
+            if (suggest_caa) {
               records.push({
                 type: 'CAA',
                 name: context.domain,
-                value: '0 issuewild "' + caa_domain + '"',
+                value: '0 issue "' + caa_domain + '"',
                 required: false,
               });
+
+              if (context.wildcard) {
+                records.push({
+                  type: 'CAA',
+                  name: context.domain,
+                  value: '0 issuewild "' + caa_domain + '"',
+                  required: false,
+                });
+              }
             }
           }
         }
@@ -633,13 +813,19 @@ function Order(options) {
           opts = opts || {};
           let skip_verify = opts.skipVerify || false;
 
-          if (skip_verify || context.autoVerify === false) {
+          // tls-alpn-01 has no cheap local self-check (it would require a raw
+          // TLS handshake with custom ALPN against ourselves) — go straight
+          // to completing and let the CA validate.
+          if (skip_verify || context.autoVerify === false || context.challengeType === 'tls-alpn-01') {
             set_context({ challenges_done: true, all_verified: true, state: 'completing' });
           } else {
             set_context({ challenges_done: true, state: 'verifying' });
           }
         }
 
+        // retry applies to the SELF-VERIFICATION stage only (before anything
+        // was submitted to the CA). Once the CA has marked a challenge
+        // invalid, the whole order is dead — a fresh order is the only fix.
         done.retry = function() {
           context.verify_attempt = 0;
           context.all_verified = false;
@@ -649,7 +835,7 @@ function Order(options) {
         params_to_set['challenges_emitted'] = true;
 
         setTimeout(function() {
-          ev.emit('dns', records, done);
+          ev.emit(event_name, records, done);
         }, 0);
       }
 
@@ -657,6 +843,12 @@ function Order(options) {
       // --- STATE: verifying (autoVerify polling) ---
 
       if (context.state === 'verifying' && context.challenges_done === true && context.all_verified === false && context._verify_running === false) {
+
+        if (context.challenges.length === 0) {
+          // same-pass transition → params_to_set (see preflight comment)
+          params_to_set['all_verified'] = true;
+          params_to_set['state'] = 'completing';
+        } else {
 
         context._verify_running = true;
 
@@ -671,19 +863,20 @@ function Order(options) {
           let checked = 0;
           let results = [];
 
-          if (total === 0) {
-            context._verify_running = false;
-            set_context({ all_verified: true, state: 'completing' });
-            return;
-          }
-
           for (let i = 0; i < context.challenges.length; i++) {
             (function(ch) {
-              verifyDnsChallenge(ch.domain, ch.value, function(err, found) {
+              let checkOne = function(cb) {
+                if (ch.type === 'http-01') {
+                  return verifyHttpChallenge(ch.identifier.value, ch.token, ch.key_authorization, cb);
+                }
+                return verifyDnsChallenge(ch.domain, ch.value, cb);
+              };
+
+              checkOne(function(err, found) {
                 if (context.aborted) { context._verify_running = false; return; }
 
                 if (found === true) ok_count++;
-                results.push({ domain: ch.domain, found: !!found });
+                results.push({ domain: ch.domain || ch.identifier.value, found: !!found });
                 checked++;
 
                 if (checked >= total) {
@@ -702,7 +895,7 @@ function Order(options) {
                     set_context({ all_verified: true, state: 'completing' });
                   } else if (context.verify_attempt >= context.autoVerifyRetries) {
                     context._verify_running = false;
-                    emitError(new Error('Challenge verification failed after ' + context.autoVerifyRetries + ' attempts (call done.retry() after fixing DNS)'), 'verify');
+                    emitError(new Error("Challenge verification ('" + context.challengeType + "') failed after " + context.autoVerifyRetries + ' attempts (fix the records/server, then call done.retry())'), 'verify');
                   } else {
                     // Schedule next round only after this one fully completed
                     context.verify_timer = setTimeout(verifyRound, context.autoVerifyInterval);
@@ -714,6 +907,7 @@ function Order(options) {
         };
 
         verifyRound();
+        }
       }
 
 
@@ -726,7 +920,9 @@ function Order(options) {
         let selected = context.challenges;
 
         if (selected.length === 0) {
-          set_context({ challenges_submitted: true, state: 'validating' });
+          // same-pass transition → params_to_set (see preflight comment)
+          params_to_set['challenges_submitted'] = true;
+          params_to_set['state'] = 'validating';
         } else {
           let submit_left = selected.length;
           let submit_results = [];
@@ -780,9 +976,11 @@ function Order(options) {
         }
 
         if (challenge_urls.length === 0) {
-          // Nothing to validate (all authorizations were already valid)
+          // Nothing to validate (all authorizations were already valid).
+          // Same-pass transition → params_to_set (see preflight comment)
           context._validating_running = false;
-          set_context({ all_authorizations_valid: true, state: 'ready' });
+          params_to_set['all_authorizations_valid'] = true;
+          params_to_set['state'] = 'ready';
         } else {
 
           let validateRound = function() {
@@ -1004,12 +1202,8 @@ function Order(options) {
 
 
   function extractExpiry(cert_pem) {
-    try {
-      let x509 = new nodeCrypto.X509Certificate(cert_pem);
-      return new Date(x509.validTo);
-    } catch(e) {
-      return null;
-    }
+    let dates = getCertDates(cert_pem);
+    return dates ? dates.expires : null;
   }
 
 
@@ -1024,6 +1218,22 @@ function Order(options) {
 
     start: function() {
       if (context.aborted) return;
+
+      // Normalize IP inputs to RFC 5952 canonical form ONCE, up front.
+      // RFC 8738 requires the canonical textual form in ACME identifiers,
+      // and canonical strings make dedup ('2a02::1' vs '2a02:0:...:0:1')
+      // and every downstream comparison trivially correct.
+      if (context.domain && net.isIP(context.domain)) {
+        context.domain = canonicalIp(context.domain);
+      }
+      if (context.altNames && context.altNames.length > 0) {
+        let normalized = [];
+        for (let i = 0; i < context.altNames.length; i++) {
+          let n = context.altNames[i];
+          normalized.push(net.isIP(n) ? canonicalIp(n) : n);
+        }
+        context.altNames = normalized;
+      }
 
       // Validate upfront — a missing email would otherwise surface as a
       // cryptic 'mailto:null' rejection from the CA, deep into the flow.
@@ -1041,6 +1251,36 @@ function Order(options) {
         problems.push('unknown provider: ' + context.provider);
       } else if (context.staging && !provider_info.staging) {
         problems.push("provider '" + context.provider + "' has no staging environment");
+      }
+
+      // --- Challenge type / IP identifier rules ---
+      let known_types = ['dns-01', 'http-01', 'tls-alpn-01'];
+      if (known_types.indexOf(context.challengeType) < 0) {
+        problems.push("unknown challengeType: '" + context.challengeType + "' (supported: " + known_types.join(', ') + ')');
+      }
+
+      let has_ip = hasIpIdentifier();
+
+      if (has_ip && context.wildcard) {
+        problems.push('wildcard is not applicable to IP addresses');
+      }
+      if (context.wildcard && context.challengeType !== 'dns-01') {
+        problems.push('wildcard certificates require dns-01 (CA policy)');
+      }
+      if (has_ip && context.challengeType === 'dns-01') {
+        // Fail here, locally and clearly — not with an opaque CA rejection.
+        problems.push("dns-01 must not be used for IP identifiers (RFC 8738 §7); set challengeType: 'http-01' or 'tls-alpn-01'");
+      }
+
+      // Let's Encrypt policy: IP certificates must use the 'shortlived'
+      // profile. There is no real choice here, so fill it in automatically
+      // rather than fail — but never silently override an explicit choice.
+      if (has_ip && context.provider === 'letsencrypt') {
+        if (context.profile === null) {
+          context.profile = 'shortlived';
+        } else if (context.profile !== 'shortlived') {
+          problems.push("Let's Encrypt requires profile: 'shortlived' for IP certificates (got '" + context.profile + "')");
+        }
       }
 
       if (problems.length > 0) {
@@ -1068,6 +1308,8 @@ function Order(options) {
 
     getState: function() { return context.state; },
     getDomain: function() { return context.domain; },
+    getProfile: function() { return context.profile; },
+    getChallengeType: function() { return context.challengeType; },
     getAccountKey: function() { return context.accountKey; },
     getPrivateKey: function() { return context.privateKey; },
     getCsr: function() { return context.csr; },                    // DER (Uint8Array) — or whatever was provided

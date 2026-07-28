@@ -1,5 +1,7 @@
 
 import * as dns from 'node:dns';
+import * as net from 'node:net';
+import { httpRequest } from './http.js';
 
 // Fallback resolver for when system DNS fails
 let fallback_resolver = new dns.Resolver();
@@ -39,6 +41,34 @@ function verifyDnsChallenge(domain, expected_value, callback) {
 
     callback(null, false);
   });
+}
+
+
+/**
+ * Verify that an http-01 challenge file is being served.
+ * Fetches http://<host>/.well-known/acme-challenge/<token> (port 80 —
+ * the same port the CA will use) and compares the body to the expected
+ * key authorization. IPv6 hosts are bracketed for the URL.
+ *
+ * Note: like the CA, this connects from "outside" the process — but unlike
+ * the CA, it runs from inside the network, so NAT hairpinning may make it
+ * succeed or fail differently than the real validation. Treat it as a
+ * sanity check, not proof of external reachability.
+ *
+ * callback(err, found)
+ */
+function verifyHttpChallenge(host, token, key_authorization, callback) {
+  let host_part = (net.isIPv6(host)) ? '[' + host + ']' : host;
+  let url = 'http://' + host_part + '/.well-known/acme-challenge/' + token;
+
+  httpRequest(url, 'GET', {}, null, function(err, res) {
+    if (err) return callback(null, false);
+    if (res.status !== 200) return callback(null, false);
+
+    // Tolerate a trailing newline — common when the file is written by hand
+    let body = res.body.toString('utf8').trim();
+    callback(null, body === key_authorization);
+  }, { timeout: 10000 });
 }
 
 
@@ -153,5 +183,6 @@ function checkCaa(domain, ca_domain, options, callback) {
 
 export {
   verifyDnsChallenge,
+  verifyHttpChallenge,
   checkCaa,
 };

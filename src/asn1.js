@@ -119,12 +119,47 @@ function ASN1_NULL() {
   return encode_tag(0x05, new Uint8Array(0));
 }
 
+// ASN.1 BOOLEAN — DER requires TRUE to be exactly 0xFF
+function BOOLEAN(value) {
+  return encode_tag(0x01, new Uint8Array([value ? 0xFF : 0x00]));
+}
+
+// UTCTime 'YYMMDDHHMMSSZ' — X.509 mandates UTCTime for dates before 2050
+// (GeneralizedTime after). Challenge certs live for hours, so UTCTime suffices.
+function UTCTIME(date) {
+  function p2(n) { return (n < 10 ? '0' : '') + n; }
+  let s = p2(date.getUTCFullYear() % 100) + p2(date.getUTCMonth() + 1) + p2(date.getUTCDate()) +
+          p2(date.getUTCHours()) + p2(date.getUTCMinutes()) + p2(date.getUTCSeconds()) + 'Z';
+  return encode_tag(0x17, new TextEncoder().encode(s));
+}
+
 function IA5STRING(str) {
   return encode_tag(0x16, new TextEncoder().encode(str));
 }
 
 function EXPLICIT(tag_num, content) {
   return encode_tag(0xA0 | tag_num, content);
+}
+
+/**
+ * Minimal DER TLV reader (the encoder's counterpart).
+ * Returns { tag, start, end, next }:
+ *   tag   — the tag byte
+ *   start — offset of the first content byte
+ *   end   — offset just past the content
+ *   next  — offset of the next sibling TLV (== end)
+ */
+function read_tlv(u8, off) {
+  let tag = u8[off];
+  let len = u8[off + 1];
+  let hdr = 2;
+  if (len & 0x80) {
+    let n = len & 0x7F;
+    len = 0;
+    for (let i = 0; i < n; i++) len = (len * 256) + u8[off + 2 + i];
+    hdr = 2 + n;
+  }
+  return { tag: tag, start: off + hdr, end: off + hdr + len, next: off + hdr + len };
 }
 
 
@@ -138,6 +173,7 @@ const OID_ORG_UNIT = '2.5.4.11';
 const OID_EMAIL = '1.2.840.113549.1.9.1';
 const OID_SAN = '2.5.29.17';   // subjectAltName
 const OID_EXTENSION_REQUEST = '1.2.840.113549.1.9.14'; // extensionRequest
+const OID_ACME_IDENTIFIER = '1.3.6.1.5.5.7.1.31';       // id-pe-acmeIdentifier (RFC 8737)
 
 // Signature algorithm OIDs
 const OID_ECDSA_SHA256 = '1.2.840.10045.4.3.2';
@@ -166,7 +202,10 @@ export {
   IA5STRING,
   PRINTABLESTRING,
   ASN1_NULL,
+  BOOLEAN,
+  UTCTIME,
   EXPLICIT,
+  read_tlv,
   OID_COMMON_NAME,
   OID_COUNTRY,
   OID_STATE,
@@ -176,6 +215,7 @@ export {
   OID_EMAIL,
   OID_SAN,
   OID_EXTENSION_REQUEST,
+  OID_ACME_IDENTIFIER,
   OID_ECDSA_SHA256,
   OID_ECDSA_SHA384,
   OID_SHA256_RSA,

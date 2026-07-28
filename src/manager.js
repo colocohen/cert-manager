@@ -2,8 +2,11 @@
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as nodeCrypto from 'node:crypto';
 import Order from './order.js';
+import { httpRequest, AcmeHttp } from './http.js';
+import * as net from 'node:net';
+import { getAriCertId, getCertDates, canonicalIp } from './crypto.js';
+import { PROVIDERS } from './providers.js';
 
 
 function Manager(options) {
@@ -19,6 +22,7 @@ function Manager(options) {
     staging: !!options.staging,
     eab: options.eab || null,
 
+    ari: options.ari !== false,   // ACME Renewal Information (RFC 9773)
     renewBeforeDays: options.renewBeforeDays || 7,
     checkInterval: options.checkInterval || 1000 * 60 * 10,
     retryInterval: options.retryInterval || 1000 * 60 * 60 * 4,
@@ -44,6 +48,11 @@ function Manager(options) {
     }
   }
 
+  // One address, one row: '2A02::0001' and '2a02::1' must be the same key
+  function normDomain(domain) {
+    return (typeof domain === 'string' && net.isIP(domain)) ? canonicalIp(domain) : domain;
+  }
+
   // Strip characters that would corrupt the CSV structure
   function csvSafe(value) {
     return String(value == null ? '' : value).replace(/[\r\n]+/g, ' ');
@@ -52,9 +61,16 @@ function Manager(options) {
 
   // --- File paths ---
 
+  // IPv6 addresses contain ':' — illegal in Windows filenames and confusing
+  // everywhere else. The CSV keeps the original identifier; only the JSON
+  // filename is sanitized.
+  function safeName(domain) {
+    return String(domain).replace(/[^a-zA-Z0-9.\-_*]/g, '_').replace(/\*/g, '_');
+  }
+
   function csvPath() { return path.join(config.dir, 'certificates.csv'); }
   function accountPath() { return path.join(config.dir, 'account.json'); }
-  function certPath(domain) { return path.join(config.dir, domain + '.json'); }
+  function certPath(domain) { return path.join(config.dir, safeName(domain) + '.json'); }
 
 
   // --- CSV helpers ---
@@ -107,20 +123,63 @@ function Manager(options) {
     });
   }
 
+  // --- CSV write serialization ---
+  // Several async paths mutate certificates.csv: renewal results, ARI
+  // refreshes (one per domain, in parallel), expiry back-fills, add/remove.
+  // Each mutation is a read-modify-write of the WHOLE file, so two running
+  // concurrently silently lose one update. A FIFO lock makes every mutation
+  // atomic relative to the others.
+  let csv_queue = [];
+  let csv_busy = false;
+
+  function withCsvLock(task) {
+    csv_queue.push(task);
+    drainCsvQueue();
+  }
+
+  function drainCsvQueue() {
+    if (csv_busy || csv_queue.length === 0) return;
+    csv_busy = true;
+    let task = csv_queue.shift();
+    let released = false;
+    task(function release() {
+      if (released) return;
+      released = true;
+      csv_busy = false;
+      drainCsvQueue();
+    });
+  }
+
   function updateCsvRow(domain, updates, callback) {
-    readCsv(function(err, rows) {
-      if (err) {
-        // Refuse to write over data we could not read
-        if (callback) callback(err);
-        return;
-      }
-      for (let i = 0; i < rows.length; i++) {
-        if (rows[i].domain === domain) {
-          for (let k in updates) rows[i][k] = updates[k];
-          break;
+    withCsvLock(function(release) {
+      readCsv(function(err, rows) {
+        if (err) {
+          // Refuse to write over data we could not read
+          release();
+          if (callback) callback(err);
+          return;
         }
-      }
-      writeCsv(rows, callback);
+        let found = false;
+        for (let i = 0; i < rows.length; i++) {
+          if (rows[i].domain === domain) {
+            for (let k in updates) rows[i][k] = updates[k];
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          // e.g. renewNow() on a domain whose CSV row went missing —
+          // append instead of silently dropping the update
+          let row = { domain: domain, status: 'pending', issued_at: '', expires_at: '',
+                      renew_after: '', last_attempt: '', last_error: '' };
+          for (let k in updates) row[k] = updates[k];
+          rows.push(row);
+        }
+        writeCsv(rows, function(werr) {
+          release();
+          if (callback) callback(werr);
+        });
+      });
     });
   }
 
@@ -130,7 +189,10 @@ function Manager(options) {
   function loadAccount(callback) {
     fs.readFile(accountPath(), 'utf8', function(err, data) {
       if (err) return callback(null, null);
-      try { callback(null, JSON.parse(data)); } catch(e) { callback(null, null); }
+      try { callback(null, JSON.parse(data)); } catch(e) {
+        console.error('[cert-manager] account.json is corrupt (' + e.message + ') — a NEW ACME account will be registered');
+        callback(null, null);
+      }
     });
   }
 
@@ -165,12 +227,121 @@ function Manager(options) {
   }
 
 
-  // --- Expiry from cert PEM ---
+  /**
+   * When to renew, derived from the certificate's ACTUAL lifetime.
+   * Margin before expiry = min(renewBeforeDays, lifetime/3):
+   *   - 90-day cert:  min(7d, 30d)    = 7d      → renew at day 83 (unchanged behavior)
+   *   - 160h cert:    min(7d, ~53.3h) = ~53.3h  → renew after ~4.4 days
+   * Without the lifetime/3 cap, renewBeforeDays (7d) would be LONGER than a
+   * short-lived cert's entire life, putting renew_after in the past at
+   * issuance time — a permanent renew-retry loop.
+   */
+  function computeRenewAfter(issued, expires) {
+    let lifetime = expires.getTime() - issued.getTime();
+    if (lifetime <= 0) return new Date(issued.getTime());
+    let margin = Math.min(config.renewBeforeDays * 86400000, lifetime / 3);
+    return new Date(expires.getTime() - margin);
+  }
 
-  function getExpiryFromCert(cert_pem) {
-    try {
-      return new Date(new nodeCrypto.X509Certificate(cert_pem).validTo);
-    } catch(e) { return null; }
+
+  // --- ARI (ACME Renewal Information, RFC 9773) ---
+  //
+  // Instead of relying only on the local renew_after computation, ask the CA
+  // when IT recommends renewing. This gives us: emergency early-renewal
+  // signals before mass revocations, load-spread renewal times, and (with
+  // the `replaces` field on the renewal order) exemption from rate limits.
+  //
+  // The endpoint is unauthenticated: GET {renewalInfo}/{certId}. We poll it
+  // per-domain no more often than the CA's Retry-After (default 6h), store
+  // the state in the domain JSON, and write the chosen renewal time into the
+  // CSV's renew_after — so the normal scan logic stays the single source of
+  // truth for WHEN to renew.
+
+  let ari_url = null;
+  let ari_url_loading = false;
+  let ari_inflight = {};
+
+  function getAriEndpoint(callback) {
+    if (!config.ari) return callback(null);
+    if (ari_url) return callback(ari_url);
+    if (ari_url_loading) return callback(null);   // another lookup is running — skip this round
+    ari_url_loading = true;
+
+    let provider = PROVIDERS[config.provider] || PROVIDERS.letsencrypt;
+    let dir_url = config.staging ? (provider.staging || provider.production) : provider.production;
+    let http = new AcmeHttp(dir_url);
+    http.getDirectory(function(err) {
+      ari_url_loading = false;
+      if (err) return callback(null);
+      ari_url = http.getUrl('renewalInfo') || null;   // null → CA doesn't offer ARI
+      callback(ari_url);
+    });
+  }
+
+  // RFC 9773 §4.3: pick a UNIFORM RANDOM moment inside the suggested window
+  // (spreads client load); if that moment is already in the past, renew now.
+  function pickTimeInWindow(start, end, now) {
+    let s = start.getTime(), e = end.getTime();
+    if (e <= s) return new Date(Math.max(s, now.getTime()));
+    let t = s + Math.random() * (e - s);
+    return new Date(Math.max(t, now.getTime()));
+  }
+
+  function refreshAriForDomain(domain) {
+    if (!config.ari || stopped || ari_inflight[domain]) return;
+    ari_inflight[domain] = true;
+
+    loadCert(domain, function(err, data) {
+      if (!data || !data.cert) { delete ari_inflight[domain]; return; }
+
+      let now = Date.now();
+      if (data.ari && data.ari.nextCheck && now < new Date(data.ari.nextCheck).getTime()) {
+        delete ari_inflight[domain]; return;
+      }
+
+      let cert_id = getAriCertId(data.cert);
+      if (!cert_id) { delete ari_inflight[domain]; return; }   // no AKI → ARI n/a
+
+      getAriEndpoint(function(endpoint) {
+        if (!endpoint) { delete ari_inflight[domain]; return; }
+
+        httpRequest(endpoint + '/' + cert_id, 'GET', {}, null, function(err2, res) {
+          let next_check = new Date(now + 6 * 3600000);   // default 6h; 1h on errors
+
+          if (err2 || !res || res.status !== 200 || !res.json || !res.json.suggestedWindow) {
+            next_check = new Date(now + 3600000);
+            data.ari = { nextCheck: next_check.toISOString(), lastError: err2 ? err2.message : ('HTTP ' + (res ? res.status : '?')) };
+            saveCert(domain, data, function() { delete ari_inflight[domain]; });
+            return;
+          }
+
+          if (res.headers['retry-after']) {
+            let ra = parseInt(res.headers['retry-after'], 10);
+            if (!isNaN(ra) && ra > 0) next_check = new Date(now + ra * 1000);
+          }
+
+          let w = res.json.suggestedWindow;
+          let renew_at = pickTimeInWindow(new Date(w.start), new Date(w.end), new Date(now));
+
+          data.ari = {
+            nextCheck: next_check.toISOString(),
+            windowStart: w.start,
+            windowEnd: w.end,
+            renewAt: renew_at.toISOString(),
+            explanationURL: res.json.explanationURL || null,
+          };
+
+          if (stopped) { delete ari_inflight[domain]; return; }
+          saveCert(domain, data, function() {
+            // The CA's word becomes the row's renew_after — the scan logic
+            // needs no ARI awareness at all
+            updateCsvRow(domain, { renew_after: renew_at.toISOString() }, function() {
+              delete ari_inflight[domain];
+            });
+          });
+        }, { timeout: 15000 });
+      });
+    });
   }
 
 
@@ -201,6 +372,27 @@ function Manager(options) {
           preflight: true,
           autoVerify: true,
         };
+
+        // Per-domain challenge/profile settings (required for IP identifiers:
+        // dns-01 is forbidden for them, so the caller must have chosen
+        // http-01 or tls-alpn-01 in add())
+        if (domainConfig.challengeType) orderOpts.challengeType = domainConfig.challengeType;
+        if (domainConfig.profile) orderOpts.profile = domainConfig.profile;
+
+        // autoVerify: false — for setups where the machine cannot reach its
+        // own public IP (NAT without hairpinning). External reachability
+        // should then be established by the caller (e.g. port-mapper)
+        // before done() is called.
+        if (domainConfig.autoVerify === false) orderOpts.autoVerify = false;
+
+        // ARI `replaces` (RFC 9773 §5): tell the CA which certificate this
+        // renewal replaces — inside the suggested window this exempts the
+        // renewal from rate limits. Order retries once without it if the CA
+        // rejects (e.g. cert already replaced), so it can never block renewal.
+        if (config.ari && domainConfig.cert) {
+          let prev_id = getAriCertId(domainConfig.cert);
+          if (prev_id) orderOpts.replaces = prev_id;
+        }
 
         if (account && account.key) {
           orderOpts.accountKey = account.key;
@@ -256,20 +448,33 @@ function Manager(options) {
               ev.emit('dns', domain, records, done);
             });
 
+            current_order.on('http', function(records, done) {
+              ev.emit('http', domain, records, done);
+            });
+
+            current_order.on('tls-alpn', function(records, done) {
+              ev.emit('tls-alpn', domain, records, done);
+            });
+
             current_order.on('certificate', function(cert) {
               let now = new Date();
               let expires = cert.expiresAt ? new Date(cert.expiresAt) : new Date(now.getTime() + 90 * 86400000);
-              let renewAfter = new Date(expires.getTime() - config.renewBeforeDays * 86400000);
+              let renewAfter = computeRenewAfter(now, expires);
 
               saveCert(domain, {
                 domain: domain, wildcard: orderOpts.wildcard, email: orderOpts.email,
+                challengeType: domainConfig.challengeType || null,
+                profile: domainConfig.profile || null,
                 cert: cert.cert, ca: cert.ca, key: cert.key, csr: cert.csr,
               }, function() {
                 updateCsvRow(domain, {
                   status: 'active',
-                  issued_at: now.toISOString().split('T')[0],
-                  expires_at: expires.toISOString().split('T')[0],
-                  renew_after: renewAfter.toISOString().split('T')[0],
+                  // Full ISO timestamps — day granularity is useless for
+                  // 160-hour certificates whose renewal window is measured
+                  // in hours. Old date-only rows still parse via new Date().
+                  issued_at: now.toISOString(),
+                  expires_at: expires.toISOString(),
+                  renew_after: renewAfter.toISOString(),
                   last_error: '',
                 }, function() {
                   ev.emit('certificate', domain, cert);
@@ -309,7 +514,6 @@ function Manager(options) {
       if (err || !data) { scanning = false; scheduleCheck(config.checkInterval); return; }
 
       let now = new Date();
-      let today = now.toISOString().split('T')[0];
       let candidates = [];
       let lines = data.trim().split('\n');
       let pending_fills = 0;
@@ -345,16 +549,16 @@ function Manager(options) {
           (function(r) {
             loadCert(r.domain, function(err2, certData) {
               if (certData && certData.cert) {
-                let expires = getExpiryFromCert(certData.cert);
-                if (expires) {
-                  r.renew_after = new Date(expires.getTime() - config.renewBeforeDays * 86400000).toISOString().split('T')[0];
+                let dates = getCertDates(certData.cert);
+                if (dates) {
+                  r.renew_after = computeRenewAfter(dates.issued, dates.expires).toISOString();
                   updateCsvRow(r.domain, {
-                    expires_at: expires.toISOString().split('T')[0],
+                    expires_at: dates.expires.toISOString(),
                     renew_after: r.renew_after,
                   });
                 }
               }
-              if (!r.renew_after || today >= r.renew_after) {
+              if (!r.renew_after || now.getTime() >= new Date(r.renew_after).getTime()) {
                 candidates.push({ domain: r.domain, last_attempt: r.last_attempt });
               }
               pending_fills--;
@@ -364,10 +568,26 @@ function Manager(options) {
           continue;
         }
 
-        if (row.renew_after && today < row.renew_after) continue;
+        // Keep the CA's opinion fresh (no-op if checked recently / disabled).
+        // Fire-and-forget: updates land in the JSON+CSV for the NEXT scan.
+        if (row.status === 'active') refreshAriForDomain(row.domain);
+
+        // Date-object comparison — works for both new full-ISO values and
+        // legacy date-only (YYYY-MM-DD) rows, which parse as UTC midnight
+        if (row.renew_after && now.getTime() < new Date(row.renew_after).getTime()) continue;
 
         if (row.last_attempt) {
-          if (now.getTime() - new Date(row.last_attempt).getTime() < config.retryInterval) continue;
+          let retry = config.retryInterval;
+          // A 4-hour retry gap is fine for 90-day certs but eats a huge
+          // slice of a short-lived cert's safety margin. Within 48h of
+          // expiry, retry every 30 minutes instead.
+          if (row.expires_at) {
+            let left = new Date(row.expires_at).getTime() - now.getTime();
+            if (left > 0 && left < 48 * 3600000) {
+              retry = Math.min(retry, 30 * 60000);
+            }
+          }
+          if (now.getTime() - new Date(row.last_attempt).getTime() < retry) continue;
         }
 
         candidates.push({ domain: row.domain, last_attempt: row.last_attempt });
@@ -386,27 +606,36 @@ function Manager(options) {
     off: function(name, fn) { ev.off(name, fn); },
 
     add: function(domain, opts) {
+      domain = normDomain(domain);
       ensureDir(function() {
         opts = opts || {};
-        readCsv(function(err, rows) {
-          if (err) { emitError(domain, err); return; }
-          for (let i = 0; i < rows.length; i++) {
-            if (rows[i].domain === domain) return;
-          }
-          // Merge with any existing cert JSON — never clobber a stored
-          // certificate just because the CSV row went missing
-          loadCert(domain, function(e2, existing) {
-            let data = existing || {};
-            data.domain = domain;
-            data.wildcard = !!opts.wildcard;
-            data.email = opts.email || config.email;
+        withCsvLock(function(release) {
+          readCsv(function(err, rows) {
+            if (err) { release(); emitError(domain, err); return; }
+            for (let i = 0; i < rows.length; i++) {
+              if (rows[i].domain === domain) { release(); return; }
+            }
+            // Merge with any existing cert JSON — never clobber a stored
+            // certificate just because the CSV row went missing
+            loadCert(domain, function(e2, existing) {
+              let data = existing || {};
+              data.domain = domain;
+              data.wildcard = !!opts.wildcard;
+              data.email = opts.email || config.email;
+              if (opts.challengeType) data.challengeType = opts.challengeType;
+              if (opts.profile) data.profile = opts.profile;
+              if (opts.autoVerify === false) data.autoVerify = false;
 
-            saveCert(domain, data, function() {
-              rows.push({
-                domain: domain, status: 'pending', issued_at: '', expires_at: '',
-                renew_after: '', last_attempt: '', last_error: '',
+              saveCert(domain, data, function() {
+                rows.push({
+                  domain: domain, status: 'pending', issued_at: '', expires_at: '',
+                  renew_after: '', last_attempt: '', last_error: '',
+                });
+                writeCsv(rows, function() {
+                  release();
+                  checkAll();
+                });
               });
-              writeCsv(rows, function() { checkAll(); });
             });
           });
         });
@@ -414,34 +643,39 @@ function Manager(options) {
     },
 
     remove: function(domain) {
+      domain = normDomain(domain);
       // If this domain is being processed right now, abort it first
       if (current === domain) {
         if (current_order) { current_order.abort(); current_order = null; }
         if (current_timeout) { clearTimeout(current_timeout); current_timeout = null; }
         current = null;
       }
-      readCsv(function(err, rows) {
-        if (err || !rows) return;
-        let filtered = [];
-        for (let i = 0; i < rows.length; i++) {
-          if (rows[i].domain !== domain) filtered.push(rows[i]);
-        }
-        writeCsv(filtered, function() {
-          fs.unlink(certPath(domain), function() {});
+      withCsvLock(function(release) {
+        readCsv(function(err, rows) {
+          if (err || !rows) { release(); return; }
+          let filtered = [];
+          for (let i = 0; i < rows.length; i++) {
+            if (rows[i].domain !== domain) filtered.push(rows[i]);
+          }
+          writeCsv(filtered, function() {
+            release();
+            fs.unlink(certPath(domain), function() {});
+          });
         });
       });
     },
 
     get: function(domain, callback) {
+      domain = normDomain(domain);
       loadCert(domain, function(err, data) {
         if (!data) return callback(null, null);
 
         if (data.cert) {
-          try {
-            let x509 = new nodeCrypto.X509Certificate(data.cert);
-            data.issued_at = new Date(x509.validFrom);
-            data.expires_at = new Date(x509.validTo);
-          } catch(e) {}
+          let dates = getCertDates(data.cert);
+          if (dates) {
+            data.issued_at = dates.issued;
+            data.expires_at = dates.expires;
+          }
           data.status = 'active';
         } else {
           data.status = 'pending';
@@ -453,6 +687,7 @@ function Manager(options) {
     list: function(callback) { readCsv(callback); },
 
     renewNow: function(domain) {
+      domain = normDomain(domain);
       if (stopped) return false;
       if (current !== null) return false;
       current = domain;
@@ -461,6 +696,11 @@ function Manager(options) {
     },
 
     status: function() { return current; },
+
+    // Internal — exposed for tests only
+    _computeRenewAfter: computeRenewAfter,
+    _certPath: certPath,
+    _updateCsvRow: updateCsvRow,
 
     start: function() {
       stopped = false;
