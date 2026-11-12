@@ -1,8 +1,8 @@
 
 import * as https from 'node:https';
 import * as http from 'node:http';
-import * as crypto from 'node:crypto';
-import { signJws, getJwk } from './crypto.js';
+import { signJws } from './crypto.js';
+import { loadKey } from './signer.js';
 
 
 /**
@@ -142,16 +142,32 @@ function AcmeHttp(directory_url, options) {
    * Retries on badNonce (RFC 8555 §6.5) up to max_nonce_retries times — never infinitely.
    * callback(err, res)
    */
-  self.signedRequest = function(url, payload, account_key_pem, account_url, callback) {
-    signedAttempt(url, payload, account_key_pem, account_url, 0, callback);
+  //
+  // account_key: a PEM private key string, a signer { publicKey, sign }, or
+  // a key already loaded by signer.loadKey (what Order passes - loaded once,
+  // not re-parsed per request). The signature may take a while, or be
+  // refused: the callback then gets the signer's error (err.code SIGN_*),
+  // and nothing is sent.
+  //
+  // A badNonce retry signs AGAIN, over the new nonce - re-sending the old
+  // body would only be refused again. With a remote signer that is one more
+  // signature, which is why retries stay bounded.
+  self.signedRequest = function(url, payload, account_key, account_url, callback) {
+    let key;
+    try {
+      key = loadKey(account_key, { use: 'account' });
+    } catch (e) {
+      return setImmediate(callback, e);
+    }
+    signedAttempt(url, payload, key, account_url, 0, callback);
   };
 
-  function signedAttempt(url, payload, account_key_pem, account_url, attempt, callback) {
+  function signedAttempt(url, payload, key, account_url, attempt, callback) {
     self.getNonce(function(err, current_nonce) {
       if (err) return callback(err);
 
       let protected_header = {
-        alg: getAlgFromKey(account_key_pem),
+        alg: key.alg.jws,
         nonce: current_nonce,
         url: url,
       };
@@ -159,12 +175,16 @@ function AcmeHttp(directory_url, options) {
       if (account_url) {
         protected_header.kid = account_url;
       } else {
-        protected_header.jwk = getJwk(account_key_pem);
+        protected_header.jwk = key.jwk;
       }
 
-      let jws = signJws(payload, protected_header, account_key_pem);
-      let body = JSON.stringify(jws);
+      signJws(payload, protected_header, key, function(serr, jws) {
+        if (serr) return callback(serr);
+        send(JSON.stringify(jws));
+      });
+    });
 
+    function send(body) {
       httpRequest(url, 'POST', {
         'Content-Type': 'application/jose+json',
         'Content-Length': Buffer.byteLength(body),
@@ -182,12 +202,12 @@ function AcmeHttp(directory_url, options) {
           if (attempt >= max_nonce_retries) {
             return callback(new Error('badNonce persisted after ' + max_nonce_retries + ' retries: ' + url));
           }
-          return signedAttempt(url, payload, account_key_pem, account_url, attempt + 1, callback);
+          return signedAttempt(url, payload, key, account_url, attempt + 1, callback);
         }
 
         callback(null, res);
       }, http_opts);
-    });
+    }
   }
 
 
@@ -199,23 +219,6 @@ function AcmeHttp(directory_url, options) {
   self.getDirectoryData = function() {
     return directory;
   };
-}
-
-
-/**
- * Determine JWS algorithm from key PEM.
- */
-function getAlgFromKey(pem) {
-  let key = crypto.createPrivateKey(pem);
-
-  if (key.asymmetricKeyType === 'ec') {
-    let jwk = key.export({ format: 'jwk' });
-    if (jwk.crv === 'P-384') return 'ES384';
-    if (jwk.crv === 'P-521') return 'ES512';
-    return 'ES256';
-  }
-
-  return 'RS256';
 }
 
 

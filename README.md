@@ -21,18 +21,21 @@
 6. [tls-alpn-01 with lemon-tls](#-tls-alpn-01-with-lemon-tls)
 7. [Certificate Manager](#-certificate-manager)
 8. [ARI - Smart Renewal Timing](#-ari---smart-renewal-timing)
-9. [API Reference - createOrder](#-api-reference---createorder)
-10. [API Reference - manager](#-api-reference---manager)
-11. [Features](#-features)
-12. [Project Structure](#-project-structure)
-13. [Providers](#-providers)
-14. [Roadmap](#-roadmap)
-15. [License](#-license)
+9. [External signers (HSM, KMS, remote signing)](#-external-signers-hsm-kms-remote-signing)
+10. [EST - private CAs (RFC 7030)](#-est---private-cas-rfc-7030)
+11. [API Reference - createOrder](#-api-reference---createorder)
+12. [API Reference - manager](#-api-reference---manager)
+13. [Features](#-features)
+14. [Project Structure](#-project-structure)
+15. [Providers](#-providers)
+16. [Testing](#-testing)
+17. [Roadmap](#-roadmap)
+18. [License](#-license)
 
 
 ## ⚡ What is cert-manager?
 
-**cert-manager** is a zero-dependency ACME client for Node.js that automates SSL/TLS certificate issuance and renewal — for **domain names and IP addresses** (IPv4 and IPv6). It implements the [ACME protocol (RFC 8555)](https://datatracker.ietf.org/doc/html/rfc8555) - the same protocol used by **Let's Encrypt**, **ZeroSSL**, and other certificate authorities - entirely in JavaScript using only `node:*` built-in modules.
+**cert-manager** is an ACME client for Node.js that automates SSL/TLS certificate issuance and renewal — for **domain names and IP addresses** (IPv4 and IPv6). It implements the [ACME protocol (RFC 8555)](https://datatracker.ietf.org/doc/html/rfc8555) - the same protocol used by **Let's Encrypt**, **ZeroSSL**, and other certificate authorities - entirely in JavaScript, with no native code.
 
 Beyond the core protocol, it implements the extensions that modern issuance requires:
 
@@ -43,6 +46,7 @@ Beyond the core protocol, it implements the extensions that modern issuance requ
 | [RFC 8738](https://datatracker.ietf.org/doc/html/rfc8738) | Certificates for IP addresses |
 | [RFC 9773](https://datatracker.ietf.org/doc/html/rfc9773) | ARI - CA-guided renewal timing + rate-limit exemption |
 | [draft-ietf-acme-profiles](https://datatracker.ietf.org/doc/draft-ietf-acme-profiles/) | Certificate profiles (e.g. Let's Encrypt `shortlived`) |
+| [RFC 7030](https://datatracker.ietf.org/doc/html/rfc7030) | EST - the same orders and manager against private CAs that speak EST |
 
 Get a wildcard certificate in 10 lines of code:
 
@@ -91,7 +95,7 @@ Existing ACME libraries for Node.js (`acme-client`, `acme`, `greenlock`) require
 - **Simple event-driven API** - You subscribe to events (`dns`, `http`, `tls-alpn`, `certificate`, `error`) instead of chaining 10 async calls. The library handles the entire ACME flow internally - errors, retries, and polling included.
 - **IP address certificates** - First-class support for IPv4 and IPv6 identifiers (RFC 8738), including the Let's Encrypt `shortlived` profile they require - selected automatically.
 - **Built-in certificate manager** - A persistent scheduler that monitors certificates, renews them automatically (ARI-guided), and stores everything to disk. Set it up once and forget about it.
-- **Zero dependencies** - Only `node:*` modules. No axios, no node-forge, no OpenSSL bindings. The entire crypto stack (JWS, CSR, X.509 challenge certificates, ASN.1 DER encoding/decoding, ECDSA signatures) is implemented from scratch.
+- **Keys that never leave their home** - The account key and the certificate key can be a PEM string, or an [external signer](#-external-signers-hsm-kms-remote-signing): an HSM, a cloud KMS, a remote or threshold signing service. The library then sees only the public key, and handles a signer that is slow, refuses, or does not answer.
 - **`npm install` and go** - No build tools, no native binaries, no platform-specific code.
 
 
@@ -367,7 +371,7 @@ The manager creates this directory structure:
 
 ```
 ./certs/
-├── account.json            - shared ACME account key
+├── account.json            - shared ACME account: its key and URL (or URL + public JWK, with accountKey)
 ├── certificates.csv        - domain status table
 ├── example.com.json        - certificate + private key + per-domain settings
 └── 2001_db8__1.json        - (IPv6 filenames are sanitized; the CSV keeps the raw address)
@@ -401,6 +405,149 @@ Because the manager is a long-running process with its own timer (not a cron job
 Disable with `ssl.manager({ ..., ari: false })`. Advanced consumers can compute identifiers directly via `ssl.crypto.getAriCertId(certPem)`.
 
 
+## 🔐 External signers (HSM, KMS, remote signing)
+
+Wherever cert-manager takes a private key - the ACME **account key** and the **certificate key** - it also takes a **signer**: an object that can sign, while the key itself stays where it is (an HSM, a cloud KMS, a remote or threshold signing service). The library sees only the public key.
+
+```js
+let order = ssl.createOrder({
+  domain: 'example.com',
+  email: 'admin@example.com',
+
+  accountKey: {
+    publicKey: accountPublicKeyPem,      // SPKI PEM or DER, or a public JWK
+    algorithm: 'ES256',                  // optional - checked against the key
+    signatureFormat: 'raw',              // ECDSA: what sign() returns - 'raw' (r||s) or 'der'
+    sign: function (bytes, cb) {         // cb(err, signature)
+      remoteSigner.sign('acme-account', bytes, cb);
+    },
+  },
+});
+
+order.on('error', (err, step) => {
+  if (err.code === 'SIGN_REJECTED') { /* the signer said no - err.cause is its own error */ }
+  if (err.code === 'SIGN_TIMEOUT')  { /* no answer in signTimeout, after retries */ }
+});
+```
+
+That is the whole change for the caller: everything else - challenges, events, the manager - works as before.
+
+### What the signer is given, and must return
+
+- **`bytes`** is the complete message to sign - not a hash of it. For the account key it is the JWS signing input of one ACME request (`base64url(header) "." base64url(payload)`); for the certificate key, the CSR's `CertificationRequestInfo`. The signer hashes as its algorithm says (SHA-256 for ES256 and RS256, SHA-384 for ES384).
+- **The signature** comes back as bytes (`Uint8Array` / `Buffer`). For ECDSA, say which form with `signatureFormat`: ACME's JWS needs raw `r||s` and X.509 needs DER, and the library converts whichever it gets. Check what yours returns - PKCS#11 (`CKM_ECDSA`) gives `r||s`, cloud KMS APIs usually give DER. Default: `'raw'` for `accountKey`, `'der'` for `privateKey`.
+- **Every signature is verified** against `publicKey` before anything is sent. A wrong key or a wrong `signatureFormat` fails at once with `SIGN_INVALID`, instead of coming back from the CA as an opaque `badSignature`.
+
+### Keys
+
+| | Account key (`accountKey`) | Certificate key (`privateKey`) |
+|---|---|---|
+| ECDSA P-256 / P-384 | ✅ ES256 / ES384 | ✅ |
+| RSA ≥ 2048 | ✅ RS256 | ✅ |
+| Ed25519 | ❌ not accepted by Let's Encrypt - refused up front | ❌ |
+| Signs | every ACME request - tens per order | the CSR - once per certificate |
+
+A key that cannot work - an unsupported type, an `algorithm` that does not match the key, a *private* JWK handed over as `publicKey` - is refused when the order starts, with `step === 'options'`, before any request.
+
+### Slow, refusing, or silent signers
+
+| Situation | What happens | `err.code` |
+|---|---|---|
+| The signer takes a while | The flow waits, up to `signTimeout` per signature (default 60 s) | — |
+| It does not answer in time | Retried `signRetries` times (default 2), with backoff; a late answer is ignored | `SIGN_TIMEOUT` |
+| It answers with an error | Not retried - a refusal is a decision. Unless the error has `retryable: true` | `SIGN_REJECTED` |
+| It answers with something that is not a valid signature by this key | Stopped before sending | `SIGN_INVALID` |
+
+The error's `step` says where in the flow it happened (`'account'`, `'order'`, `'csr'`, ...). When the CA answers `badNonce`, the request is signed **again** over the new nonce - one more signature, which is why those retries are bounded too.
+
+For a signer that applies a policy: the bytes describe themselves. The JWS protected header holds the request's `url` and `nonce`, and the payload is readable JSON, so a signing service can decode them and allow only requests to the CA's own URLs.
+
+### The certificate key in an HSM
+
+```js
+ssl.createOrder({
+  domain: 'example.com',
+  email: 'admin@example.com',
+  privateKey: { publicKey: hsmPublicKeyPem, signatureFormat: 'raw', sign: hsmSign },
+});
+```
+
+The CSR is built and signed through the signer; the issued certificate carries the HSM's public key. The `certificate` event then gives `key: null` - there is no private key to hand back. The CSR is built beside the ACME requests, so a slow signature only delays the final step that needs it.
+
+### With the manager
+
+```js
+let mgr = ssl.manager({
+  dir: './certs',
+  email: 'admin@example.com',
+  accountKey: accountSigner,                       // a signer, or a PEM string
+  certKey: function (domain, cb) {                 // optional, per domain
+    cb(null, hsmSignerFor(domain));                //   or cb(null, null) for a fresh key
+  },
+  orderTimeout: 30 * 60 * 1000,                    // when signing may wait for a person
+});
+```
+
+- **`account.json` keeps only `{ url, jwk }`** when `accountKey` is given - no private key is written. The URL is reused only if it was registered with the same key (same JWK thumbprint). A file left by another key - for example the generated key of an earlier setup - is renamed to `account.json.<time>.bak`, never overwritten, and a new account is registered; the `error` event says so.
+- Certificates whose key comes from `certKey` are stored with `key: null`.
+- Without `accountKey`, nothing changes: a key is generated and kept in `account.json`, as before.
+
+### The crypto helpers
+
+`ssl.crypto.signJws` and `ssl.crypto.createCsr` keep their synchronous PEM form. Add a callback as the last argument and they also take a signer:
+
+```js
+ssl.crypto.createCsr({ commonName: 'example.com' }, signer, function (err, der) { /* ... */ });
+ssl.crypto.signJws(payload, header, signer, function (err, jws) { /* ... */ });
+```
+
+
+## 🏢 EST - private CAs (RFC 7030)
+
+Inside an organization, the CA is often not an ACME CA: EJBCA, Cisco, many enterprise PKIs - and [ca-manager](https://github.com/colocohen/ca-manager) - speak **EST**. The same `createOrder` and the same manager talk to them; only `provider` changes:
+
+```js
+let order = ssl.createOrder({
+  domain: 'db.internal.example.com',
+  provider: { est: 'https://est.example.com', ca: estServerRootPem },   // label: 'client' for a CA label
+  auth: { username: 'svc-db', password: process.env.EST_PASSWORD },     // or { clientCert, clientKey }
+});
+
+order.on('pending', (info) => { /* { retryAfter, attempt } - the CA is still deciding (an approval) */ });
+order.on('certificate', (cert) => {
+  // cert.cert, cert.key, cert.csr, cert.expiresAt - as with ACME
+  // cert.ca      - the chain to send with it
+  // cert.cacerts - every CA certificate the server gave, for trust stores
+  // cert.via     - 'simpleenroll' or 'simplereenroll'
+});
+order.on('error', (err, step) => { /* err.code 'EST_UNAUTHORIZED' / 'EST_FORBIDDEN', err.status */ });
+order.start();
+```
+
+There are no challenges: the client proves who it is, with a password (HTTP Basic), a certificate it already holds (TLS client authentication - a device's factory certificate, say), or both. What only ACME has - `challengeType`, `eab`, `accountKey`, `profile`, `replaces`, `staging` - is refused by name, not ignored.
+
+**Renewing** goes with the current certificate: `renew: { cert, key }` sends `simplereenroll`, authenticated by that certificate over TLS. If the CA refuses it (revoked, policy changed), and `auth` is given, the order enrolls anew with `auth`. A key held by a signer cannot authenticate TLS from Node, so then the renewal goes straight to `auth`; the CSR is still signed by the signer.
+
+**What comes back is checked** before `certificate` fires: the certificate must be for the key in the CSR, and issued by one of the CA certificates the server gave (`cacerts`). The chain (`cert.ca`) runs from the issuer up and stops before a self-signed root; after the CA [rotated its root](https://github.com/colocohen/ca-manager#rotating-the-ca-key), it is the cross certificate, so clients that trust only the old root still verify.
+
+**Approvals that take time**: a CA that answers 202 is asked again after its `Retry-After`, with a `pending` event each time, up to `pendingTimeout` (10 minutes by default). ACME orders give the same `pending` event while the CA is `processing`.
+
+**The manager** works the same way - no email, no account, no ARI:
+
+```js
+let mgr = ssl.manager({
+  dir: './certs',
+  provider: { est: 'https://est.example.com', ca: estServerRootPem },
+  auth: { username: 'svc', password: process.env.EST_PASSWORD },
+});
+mgr.add('db.internal.example.com');
+mgr.on('certificate', (domain, cert) => { /* install it */ });
+mgr.start();
+```
+
+Renewals go with the certificate on disk (`simplereenroll`), and fall back to `auth`. The renewal timing, the files and the CSV are as with ACME.
+
+
 ## 📘 API Reference - createOrder
 
 ### Options
@@ -412,7 +559,8 @@ ssl.createOrder({
 
   wildcard: false,              // also issue *.example.com (dns-01 + domains only)
   altNames: [],                 // additional SANs — domains and/or IPs
-  provider: 'letsencrypt',      // 'letsencrypt' or 'zerossl'
+  provider: 'letsencrypt',      // 'letsencrypt', 'zerossl', { acme: directoryUrl },
+                                // or { est: url, label, ca } - see Providers, EST
   staging: false,               // use staging environment for testing
 
   // Challenge & profile
@@ -424,10 +572,14 @@ ssl.createOrder({
   replaces: null,               // ARI certId of the cert this order replaces
                                 // (the manager fills this in automatically)
 
-  // Keys (auto-generated if not provided)
-  accountKey: null,             // PEM - reuse existing account
-  privateKey: null,             // PEM - reuse existing key
-  csr: null,                    // PEM - provide your own CSR
+  // Keys (auto-generated if not provided) - a PEM string, or a signer
+  // { publicKey, sign, algorithm, signatureFormat } (see External signers)
+  accountKey: null,             // reuse an existing account key
+  accountUrl: null,             // its account URL - skips newAccount
+  privateKey: null,             // the certificate's key
+  csr: null,                    // PEM or DER - provide your own CSR
+  signTimeout: 60000,           // ms for one signature by a signer
+  signRetries: 2,               // after a timeout, or an error marked retryable
 
   // EAB (for ZeroSSL)
   eab: null,                    // { kid: '...', hmacKey: '...' }
@@ -449,12 +601,13 @@ ssl.createOrder({
 | `dns` | `(records, done)` | dns-01: TXT records to set. Call `done()` when ready. |
 | `http` | `(records, done)` | http-01: `{ identifier, token, keyAuthorization, path }` per challenge. Serve `keyAuthorization` at `http://<identifier>:80<path>`, then `done()`. |
 | `tls-alpn` | `(records, done)` | tls-alpn-01: `{ identifier, sniName, alpnProtocol, cert, key, keyAuthorization, keyAuthorizationDigest }`. Serve `cert`/`key` on :443 for SNI `sniName`, then `done()`. |
-| `certificate` | `(cert)` | Certificate issued. `cert.cert`, `cert.ca`, `cert.key`, `cert.csr`, `cert.expiresAt` |
-| `account` | `(account)` | Account created. `account.url`, `account.key` |
+| `certificate` | `(cert)` | Certificate issued. `cert.cert`, `cert.ca`, `cert.key` (`null` when `privateKey` is a signer), `cert.csr`, `cert.expiresAt` |
+| `account` | `(account)` | Account created. `account.url`, `account.key` (the PEM, or the signer) |
 | `verify` | `(info)` | Self-verification progress. `info.attempt`, `info.found`, `info.expected` |
 | `validating` | `(info)` | CA validation progress. `info.attempt`, `info.statuses` |
 | `completing` | `(info)` | Challenge submission results. `info.results` |
-| `error` | `(err, step)` | Error at a specific step |
+| `pending` | `(info)` | The CA is still deciding: `{ retryAfter, attempt }` - ACME `processing`, EST 202 |
+| `error` | `(err, step)` | Error at a specific step. Signing failures carry `err.code`: `SIGN_REJECTED`, `SIGN_TIMEOUT`, `SIGN_INVALID` |
 
 `done(opts)` accepts `{ skipVerify: true }` to bypass self-verification (useful behind NAT without hairpinning). `done.retry()` restarts verification after fixing records.
 
@@ -468,8 +621,8 @@ ssl.createOrder({
 | `order.getDomain()` | Domain / IP |
 | `order.getProfile()` | Effective certificate profile (may be auto-set) |
 | `order.getChallengeType()` | Effective challenge type |
-| `order.getAccountKey()` | Account key PEM |
-| `order.getPrivateKey()` | Private key PEM |
+| `order.getAccountKey()` | Account key - PEM, or the signer given |
+| `order.getPrivateKey()` | Private key - PEM, or the signer given |
 | `order.getCsr()` | CSR (DER buffer or PEM) |
 
 ## 📘 API Reference - manager
@@ -485,6 +638,12 @@ ssl.manager({
   eab: null,                    // { kid, hmacKey } for ZeroSSL
   ari: true,                    // ARI renewal guidance (RFC 9773)
   renewBeforeDays: 7,           // renewal margin — capped at ⅓ of the cert's lifetime
+
+  accountKey: null,             // PEM or signer - then account.json holds no private key
+  certKey: null,                // function (domain, cb) → cb(null, signerOrPem | null)
+  orderTimeout: 600000,         // one whole issuance, in ms
+  signTimeout: 60000,           // passed to each order
+  signRetries: 2,
 });
 ```
 
@@ -496,6 +655,7 @@ ssl.manager({
 | `mgr.remove(domain)` | Remove domain from CSV + delete JSON |
 | `mgr.get(domain, callback)` | Get certificate + metadata from JSON file |
 | `mgr.list(callback)` | List all domains from CSV |
+| `mgr.store(domain, { cert, key, ca }, callback)` | Keep a certificate issued elsewhere (PEM); never renewed here. Refused unless the key is the certificate's, it covers `domain` (its subjectAltName - a common name alone covers nothing, as in browsers), it has not expired, and `ca` (an array of PEM, or one bundle) decodes. An older certificate does not replace a newer one. `callback(err, { stored, expiresAt } \| { stored: false, reason })` |
 | `mgr.renewNow(domain)` | Force immediate renewal |
 | `mgr.status()` | Domain currently being renewed, or `null` |
 | `mgr.start()` | Start the manager - reads CSV, begins processing |
@@ -510,17 +670,19 @@ ssl.manager({
 | `tls-alpn` | `(domain, records, done)` | tls-alpn-01 certs to install. Call `done()` when live. |
 | `certificate` | `(domain, cert)` | Certificate issued or renewed |
 | `renewing` | `(domain, daysLeft)` | Renewal started |
+| `pending` | `(domain, info)` | The CA is still deciding (an approval) |
 | `error` | `(domain, err)` | Error during renewal |
 
 ### Built-in protections
 
 - **Serial processing** - one domain at a time, never parallel
 - **Retry throttle** - minimum 4 hours between attempts per domain (30 minutes within 48h of expiry)
-- **Timeout** - 10 minutes per domain, then abort and move on
+- **Timeout** - `orderTimeout` per domain (10 minutes by default), then abort and move on
 - **Priority** - domains never attempted are processed first, then oldest attempts
 - **Duplicate ignore** - `add()` silently skips existing domains
 - **Renewal window** - derived from the real certificate lifetime, refined by ARI
 - **Atomic writes** - the CSV is written via temp-file + rename; a crash can't corrupt it
+- **Private files** - `account.json` and each certificate's JSON are written readable by the owner only (`0600`)
 
 
 ## ✨ Features
@@ -532,14 +694,14 @@ ssl.manager({
 - **ARI** (RFC 9773) - CA-guided renewal windows, `replaces` on renewals, rate-limit exemption
 - **tls-alpn-01 challenge certificates built in** - critical acmeIdentifier extension, iPAddress SANs, reverse-arpa SNI names - ready for any TLS server (pairs naturally with [lemon-tls](https://github.com/colocohen/lemon-tls))
 - Event-driven API - no callback hell, no manual orchestration
-- Zero dependencies - only `node:*` built-in modules
+- External signers for the account and certificate keys - HSM, KMS, remote or threshold signing - with timeouts, retries and clear errors
 - Let's Encrypt and ZeroSSL support (any ACME-compatible CA)
 - External Account Binding (EAB) for ZeroSSL
 - Wildcard certificates (`*.example.com`)
 - Certificate + CA chain separation
 - CAA record preflight check (auto-skipped for IP identifiers)
 - Challenge self-verification with fallback DNS resolvers (8.8.8.8, 1.1.1.1), skippable for NAT setups
-- Automatic key generation (ECDSA P-256/P-384 or RSA)
+- Automatic key generation (ECDSA P-256/P-384 or RSA), or bring your own key or signer
 - Custom CSR fields (country, organization, etc.)
 - badNonce auto-retry
 - Certificate manager with persistent storage (CSV + JSON), lifetime-aware renewal for short-lived certificates
@@ -554,15 +716,24 @@ cert-manager/
 ├── index.cjs                - CommonJS wrapper
 ├── index.d.ts               - TypeScript definitions
 ├── package.json
-└── src/
-    ├── order.js              - Certificate order engine (state machine)
-    ├── manager.js            - Certificate manager with auto-renewal + ARI
-    ├── crypto.js             - Keys, CSR, JWS, EAB, tls-alpn certs, ARI certIds
-    ├── http.js               - ACME HTTP client with JWS authentication
-    ├── verify.js             - DNS TXT / HTTP challenge verification + CAA check
-    ├── asn1.js               - DER encoding/decoding for CSR + X.509 generation
-    └── providers.js          - CA directory URLs (Let's Encrypt, ZeroSSL)
+├── src/
+│   ├── order.js              - Certificate order engine (state machine)
+│   ├── manager.js            - Certificate manager with auto-renewal + ARI
+│   ├── crypto.js             - Keys, CSR, JWS, EAB, tls-alpn certs, ARI certIds
+│   ├── signer.js             - PEM keys and external signers behind one interface
+│   ├── certs.js              - certificates read by cryptographic-formats; issuer and signature checks (as lemon-tls's)
+│   ├── http.js               - ACME HTTP client with JWS authentication
+│   ├── verify.js             - DNS TXT / HTTP challenge verification + CAA check
+│   ├── est.js                - EST client (RFC 7030): what createOrder runs for provider: { est }
+│   └── providers.js          - the provider option: named CAs, { acme: url }, { est: url }
+└── test/
+    ├── signer.test.js        - signers, CSR, JWS, ALPN cert, ARI - checked with openssl
+    ├── http.test.js          - badNonce and refused signatures, against a stand-in CA
+    ├── pebble.test.js        - complete orders against Pebble
+    └── est.test.js           - EST against a real EST server (ca-manager), checked with openssl
 ```
+
+The formats - CSR, X.509, JWS, JWK - are written by [cryptographic-formats](https://github.com/colocohen/cryptographic-formats), which performs no cryptography: it hands back the exact bytes to sign, and cert-manager (or your signer) signs them.
 
 
 ## 🌐 Providers
@@ -593,6 +764,48 @@ ssl.createOrder({
 
 Note: IP certificates and the `shortlived` profile are Let's Encrypt features; other CAs may differ.
 
+### Any ACME server
+
+```js
+ssl.createOrder({
+  domain: 'app.internal.example.com',
+  email: 'admin@example.com',
+  provider: { acme: 'https://ca.internal.example.com/acme/directory' },   // step-ca, ca-manager, Pebble...
+  // caa: 'ca.internal.example.com' - its CAA identity, to run the CAA preflight; without it, skipped
+});
+```
+
+The manager takes the same `provider`, and finds that server's ARI in its directory.
+
+### EST
+
+`provider: { est: url, label, ca }` - see [EST](#-est---private-cas-rfc-7030).
+
+An unknown provider name is an error (`Invalid options: unknown provider`), never a silent fallback.
+
+
+## 🧪 Testing
+
+```bash
+npm test
+```
+
+`test/certs.test.js` checks the issuer and signature checks one by one (a CA with the issuer's key under another name, two CAs of one name, a tampered signature, a certificate that only names itself), and `test/store.test.js` checks `mgr.store()` with certificates openssl makes: names, wildcards, IP addresses, a common name alone, another key, an expired certificate, a broken bundle, an older certificate. The unit tests check every CSR and certificate with `openssl`, and JWS signatures with `node:crypto`. The end-to-end tests run complete orders against [Pebble](https://github.com/letsencrypt/pebble), Let's Encrypt's ACME test server - all three challenge types, IP identifiers, wildcards, EAB, the manager, and signers that are slow, refuse, time out, return DER, or sign with the wrong key. They run when Pebble is installed:
+
+```bash
+go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@latest
+
+PEBBLE=$(go env GOPATH)/bin/pebble \
+PEBBLE_CHALLTESTSRV=$(go env GOPATH)/bin/pebble-challtestsrv \
+PEBBLE_DIR=$(go env GOMODCACHE)/github.com/letsencrypt/pebble/v2@v2.10.1 \
+npm test
+```
+
+EST is tested against a real EST server over HTTPS - [ca-manager](https://github.com/colocohen/ca-manager)'s, taken from the sibling directory or `CA_MANAGER=/path`: a password, a device certificate, a CA label, renewal with the current certificate and its fallback when revoked, 202 approvals and `pendingTimeout`, the chain after the CA rotated its root (verified by openssl with the old root only), and a dishonest server - a certificate for another key, from a CA it did not name, or a server certificate nobody trusts - refused. ca-manager is written by the same hands, so it is not an independent check of EST; [libest](https://github.com/cisco/libest) would be.
+
+Pebble uses ports 14000, 14010, 15000, 15010; the tests serve challenges on 5001 and 5002, and DNS on 8053.
+
 
 ## 🛣 Roadmap
 
@@ -612,13 +825,15 @@ Note: IP certificates and the `shortlived` profile are Let's Encrypt features; o
 - CSR with custom fields
 - Certificate manager with auto-renewal (lifetime-aware)
 - Persistent storage (CSV + JSON)
+- External signers (HSM, KMS, remote signing) for account and certificate keys
+- Any ACME server (`provider: { acme: url }`)
+- EST (RFC 7030) - enroll, renew with the current certificate, approvals that take time; the manager over EST
 - ESM + CommonJS + TypeScript support
 
 ### ⏳ Planned
 - Certificate revocation (RFC 8555 §7.6)
 - DNS provider API integration (Cloudflare, Route53)
 - Account key rollover
-- Custom ACME directory URL
 - Per-identifier challenge types in mixed orders
 
 _Community contributions are welcome! Please ⭐ star the repo to follow progress._

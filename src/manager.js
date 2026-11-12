@@ -5,8 +5,12 @@ import * as path from 'node:path';
 import Order from './order.js';
 import { httpRequest, AcmeHttp } from './http.js';
 import * as net from 'node:net';
+import { createPrivateKey, createPublicKey } from 'node:crypto';
+import { x509 } from 'cryptographic-formats';
+import { readCert, certificatePems, spkiHex } from './certs.js';
 import { getAriCertId, getCertDates, canonicalIp } from './crypto.js';
-import { PROVIDERS } from './providers.js';
+import { loadKey } from './signer.js';
+import { resolveProvider } from './providers.js';
 
 
 function Manager(options) {
@@ -22,11 +26,47 @@ function Manager(options) {
     staging: !!options.staging,
     eab: options.eab || null,
 
+    // EST (provider: { est: url }): who this client is - { username,
+    // password } and/or { clientCert, clientKey }. A renewal goes with the
+    // current certificate first, and falls back to these.
+    auth: options.auth || null,
+
     ari: options.ari !== false,   // ACME Renewal Information (RFC 9773)
     renewBeforeDays: options.renewBeforeDays || 7,
     checkInterval: options.checkInterval || 1000 * 60 * 10,
     retryInterval: options.retryInterval || 1000 * 60 * 60 * 4,
+
+    // The ACME account key: a PEM string or a signer { publicKey, sign }.
+    // Given here, it is never written to disk - account.json keeps only
+    // the account URL and the public JWK. Not given: generated and stored
+    // in account.json, as before.
+    accountKey: options.accountKey || null,
+
+    // The certificate's key, per name: function (domain, cb) calling
+    // cb(null, signerOrPem) - or cb(null, null) for a fresh key, the
+    // default. For keys held in an HSM; the key is then not in the
+    // certificate's JSON file, and 'certificate' gives key: null.
+    certKey: (typeof options.certKey === 'function') ? options.certKey : null,
+
+    // One whole issuance, from account to certificate. Longer when a signer
+    // may wait for a human approval.
+    orderTimeout: options.orderTimeout || 1000 * 60 * 10,
+    signTimeout: options.signTimeout || undefined,
+    signRetries: options.signRetries,
   };
+
+  // The provider, resolved once. One that cannot work leaves this null:
+  // every order then reports it, as before.
+  let provider_info = null;
+  try { provider_info = resolveProvider(config.provider, config.staging); } catch (e) { provider_info = null; }
+  let est = !!(provider_info && provider_info.protocol === 'est');
+
+  // A configured accountKey that cannot work is a configuration error -
+  // thrown at construction, not discovered at the first renewal.
+  let account_key = null;
+  if (config.accountKey) {
+    account_key = loadKey(config.accountKey, { use: 'account' });
+  }
 
   let check_timer = null;
   let current = null;
@@ -196,8 +236,55 @@ function Manager(options) {
     });
   }
 
+  // 0600: account.json may hold the account's private key, and each
+  // certificate's JSON its key. Readable by the process owner only.
+  function writePrivate(file, data, callback) {
+    callback = callback || function() {};
+    fs.writeFile(file, data, { mode: 0o600 }, function(err) {
+      if (err) return callback(err);
+      // mode applies only when the file is created; an existing one from an
+      // older version keeps its permissions unless they are set here
+      fs.chmod(file, 0o600, function() { callback(null); });
+    });
+  }
+
   function saveAccount(account, callback) {
-    fs.writeFile(accountPath(), JSON.stringify(account, null, 2), callback || function() {});
+    writePrivate(accountPath(), JSON.stringify(account, null, 2), callback);
+  }
+
+  // The account to order with:
+  //   no configured accountKey  → account.json's key and URL, as before
+  //   a configured accountKey   → that key; account.json's URL only when it
+  //                               was registered with this same key (same
+  //                               JWK thumbprint). A file from another key
+  //                               is set aside as account.json.<time>.bak -
+  //                               it may hold the old private key - and a
+  //                               new account is registered.
+  function resolveAccount(account, callback) {
+    if (!account_key) {
+      if (account && account.key) return callback({ key: account.key, url: account.url || null });
+      return callback({ key: null, url: null });
+    }
+
+    if (!account) return callback({ key: config.accountKey, url: null });
+
+    let saved_thumbprint = null;
+    try {
+      if (account.jwk) saved_thumbprint = loadKey({ publicKey: account.jwk, sign: function() {} }, { use: 'account' }).thumbprint;
+      else if (account.key) saved_thumbprint = loadKey(account.key, { use: 'account' }).thumbprint;
+    } catch (e) { saved_thumbprint = null; }
+
+    if (saved_thumbprint === account_key.thumbprint) {
+      return callback({ key: config.accountKey, url: account.url || null });
+    }
+
+    let backup = accountPath() + '.' + Date.now() + '.bak';
+    fs.rename(accountPath(), backup, function(err) {
+      emitError('account', new Error('account.json belongs to a different key than accountKey - ' +
+        (err ? 'could not set it aside (' + err.message + ')' : 'moved to ' + path.basename(backup)) +
+        '; registering a new ACME account'));
+      callback({ key: config.accountKey, url: null });
+    });
   }
 
 
@@ -211,7 +298,7 @@ function Manager(options) {
   }
 
   function saveCert(domain, data, callback) {
-    fs.writeFile(certPath(domain), JSON.stringify(data, null, 2), callback || function() {});
+    writePrivate(certPath(domain), JSON.stringify(data, null, 2), callback);
   }
 
 
@@ -262,14 +349,12 @@ function Manager(options) {
   let ari_inflight = {};
 
   function getAriEndpoint(callback) {
-    if (!config.ari) return callback(null);
+    if (!config.ari || est || !provider_info) return callback(null);     // ARI is ACME's
     if (ari_url) return callback(ari_url);
     if (ari_url_loading) return callback(null);   // another lookup is running — skip this round
     ari_url_loading = true;
 
-    let provider = PROVIDERS[config.provider] || PROVIDERS.letsencrypt;
-    let dir_url = config.staging ? (provider.staging || provider.production) : provider.production;
-    let http = new AcmeHttp(dir_url);
+    let http = new AcmeHttp(provider_info.directory);
     http.getDirectory(function(err) {
       ari_url_loading = false;
       if (err) return callback(null);
@@ -345,6 +430,80 @@ function Manager(options) {
   }
 
 
+  // --- External certificates ---
+  //
+  // A certificate issued somewhere else — another server that owns the
+  // renewal, or a file the operator installed — kept here so it is served,
+  // listed and delivered like any other, but never renewed from here. Its row
+  // carries status 'external'; the scan skips it, ARI is not polled for it,
+  // and renewNow() refuses it. The source replaces it by storing a newer one.
+
+  // Everything that can be wrong with a certificate handed to store(), found
+  // before anything is written. Parsing it here rather than trusting the
+  // caller is what keeps a mistaken push — the wrong file, the key from the
+  // previous certificate, a certificate for another name — from replacing a
+  // working certificate with one that fails every handshake.
+  function checkExternalCert(domain, pem) {
+    if (!pem || !pem.cert || !pem.key) return { error: new Error('cert and key are required') };
+
+    let cert, key;
+    try { cert = readCert(pem.cert); }
+    catch (e) { return { error: new Error('cert is not a PEM certificate: ' + e.message) }; }
+    try { key = createPrivateKey(pem.key); }
+    catch (e) { return { error: new Error('key is not a PEM private key: ' + e.message) }; }
+    if (pem.ca && !Array.isArray(pem.ca)) {
+      try { certificatePems(pem.ca); }
+      catch (e) { return { error: new Error('ca is not a PEM bundle: ' + e.message) }; }
+    }
+
+    let certKey = cert.publicKey();
+    if (!certKey || spkiHex(createPublicKey(key)) !== spkiHex(certKey)) {
+      return { error: new Error('key does not belong to this certificate') };
+    }
+
+    // The name in the subjectAltName (cryptographic-formats, RFC 9525): an address
+    // against its iPAddress names, a host against its DNS names, a wildcard
+    // a whole leftmost label. Not the common name — browsers stopped
+    // reading it in 2017, so a certificate with nothing else covers no one.
+    let covers;
+    try { covers = x509.hostname_matches(cert.cf, domain); } catch (e) { covers = false; }
+    if (!covers) return { error: new Error('certificate does not cover ' + domain) };
+
+    let issued = new Date(cert.notBefore.getTime());
+    let expires = new Date(cert.notAfter.getTime());
+    if (expires.getTime() <= Date.now()) {
+      return { error: new Error('certificate expired at ' + expires.toISOString()) };
+    }
+    return { issued: issued, expires: expires };
+  }
+
+  // The chain as the rest of the manager keeps it: an array of PEM blocks,
+  // the shape an issued certificate's `ca` has. Accepts that, or one string
+  // holding several blocks, as a PEM bundle file does.
+  function normCa(ca) {
+    if (!ca) return [];
+    if (Array.isArray(ca)) return ca;
+    return certificatePems(ca);      // checked in checkExternalCert
+  }
+
+  // Nobody renews an external certificate here, so the one failure that
+  // matters is the source going quiet. Once a certificate is past the point
+  // where a managed one would have been renewed and nothing newer has
+  // arrived, say so — at most hourly, since the scan runs every few minutes.
+  let external_warned = {};
+
+  function warnIfExternalDue(row, now) {
+    if (!row.issued_at || !row.expires_at) return;
+    let due = computeRenewAfter(new Date(row.issued_at), new Date(row.expires_at));
+    if (now.getTime() < due.getTime()) return;
+    if (now.getTime() - (external_warned[row.domain] || 0) < 3600000) return;
+    external_warned[row.domain] = now.getTime();
+    let hoursLeft = Math.round((new Date(row.expires_at).getTime() - now.getTime()) / 3600000);
+    emitError(row.domain, new Error('external certificate is due for replacement and nothing newer has been stored — ' +
+      (hoursLeft > 0 ? hoursLeft + 'h left' : 'EXPIRED')));
+  }
+
+
   // --- Timer ---
 
   function scheduleCheck(delay) {
@@ -360,9 +519,64 @@ function Manager(options) {
     if (stopped) { current = null; return; }
     loadCert(domain, function(err, domainConfig) {
       domainConfig = domainConfig || {};
-      loadAccount(function(err2, account) {
 
-        let orderOpts = {
+      // The scan never picks an external row; this is renewNow() asking.
+      // Issuing here would start a second owner for the name — two servers
+      // renewing independently, each overwriting the other.
+      if (domainConfig.external) {
+        current = null;
+        emitError(domain, new Error('certificate is external — it is renewed where it was issued, not here'));
+        return;
+      }
+
+      // EST has no account: straight to the certificate's key
+      let withAccount = est
+        ? function(cb) { cb(null, {}); }
+        : function(cb) { loadAccount(function(err2, saved) { resolveAccount(saved, function(account) { cb(null, account); }); }); };
+
+      withAccount(function(err2, account) {
+        resolveCertKey(domain, function(kerr, cert_key) {
+          if (stopped) { current = null; return; }
+          if (kerr) {
+            updateCsvRow(domain, { status: 'error', last_error: ('certKey: ' + (kerr.message || kerr)).substring(0, 100), last_attempt: new Date().toISOString() }, function() {
+              emitError(domain, kerr);
+              current = null;
+              scheduleCheck(100);
+            });
+            return;
+          }
+          startOrder(domain, domainConfig, account, cert_key);
+        });
+      });
+    });
+  }
+
+
+  // certKey(domain, cb) when configured; null otherwise (a fresh key per
+  // certificate, as always). Called once per issuance.
+  function resolveCertKey(domain, callback) {
+    if (!config.certKey) return callback(null, null);
+    let answered = false;
+    function once(err, key) {
+      if (answered) return;
+      answered = true;
+      if (err) return callback(err);
+      if (key == null) return callback(null, null);
+      try { loadKey(key, { use: 'certificate' }); } catch (e) { return callback(e); }
+      callback(null, key);
+    }
+    try { config.certKey(domain, once); } catch (e) { once(e); }
+  }
+
+
+  function startOrder(domain, domainConfig, account, cert_key) {
+        let orderOpts = est ? {
+          domain: domain,
+          wildcard: !!domainConfig.wildcard,
+          email: domainConfig.email || config.email,
+          provider: config.provider,
+          auth: config.auth,
+        } : {
           domain: domain,
           wildcard: !!domainConfig.wildcard,
           email: domainConfig.email || config.email,
@@ -373,32 +587,41 @@ function Manager(options) {
           autoVerify: true,
         };
 
+        // EST renews with the current certificate (simplereenroll), when its
+        // key is here; refused, the order falls back to auth
+        if (est && domainConfig.cert && domainConfig.key) {
+          orderOpts.renew = { cert: domainConfig.cert, key: domainConfig.key };
+        }
+
         // Per-domain challenge/profile settings (required for IP identifiers:
         // dns-01 is forbidden for them, so the caller must have chosen
         // http-01 or tls-alpn-01 in add())
-        if (domainConfig.challengeType) orderOpts.challengeType = domainConfig.challengeType;
-        if (domainConfig.profile) orderOpts.profile = domainConfig.profile;
+        if (!est && domainConfig.challengeType) orderOpts.challengeType = domainConfig.challengeType;
+        if (!est && domainConfig.profile) orderOpts.profile = domainConfig.profile;
 
         // autoVerify: false — for setups where the machine cannot reach its
         // own public IP (NAT without hairpinning). External reachability
         // should then be established by the caller (e.g. port-mapper)
         // before done() is called.
-        if (domainConfig.autoVerify === false) orderOpts.autoVerify = false;
+        if (!est && domainConfig.autoVerify === false) orderOpts.autoVerify = false;
 
         // ARI `replaces` (RFC 9773 §5): tell the CA which certificate this
         // renewal replaces — inside the suggested window this exempts the
         // renewal from rate limits. Order retries once without it if the CA
         // rejects (e.g. cert already replaced), so it can never block renewal.
-        if (config.ari && domainConfig.cert) {
+        if (!est && config.ari && domainConfig.cert) {
           let prev_id = getAriCertId(domainConfig.cert);
           if (prev_id) orderOpts.replaces = prev_id;
         }
 
-        if (account && account.key) {
+        if (!est && account.key) {
           orderOpts.accountKey = account.key;
           // Known account URL — Order skips the newAccount round-trip entirely
           if (account.url) orderOpts.accountUrl = account.url;
         }
+        if (cert_key) orderOpts.privateKey = cert_key;
+        if (config.signTimeout) orderOpts.signTimeout = config.signTimeout;
+        if (config.signRetries >= 0) orderOpts.signRetries = config.signRetries;
 
         readCsv(function(err3, rows) {
           if (err3 || !rows) rows = [];
@@ -436,12 +659,15 @@ function Manager(options) {
             current_timeout = setTimeout(function() {
               if (current_order) current_order.abort();
               updateCsvRow(domain, { status: 'error', last_error: 'timeout' });
-              emitError(domain, new Error('Renewal timed out'));
+              emitError(domain, new Error('Renewal timed out after ' + Math.round(config.orderTimeout / 1000) + 's'));
               finish();
-            }, 1000 * 60 * 10);
+            }, config.orderTimeout);
 
             current_order.on('account', function(acct) {
-              saveAccount({ key: acct.key, url: acct.url });
+              // A key that is not ours to keep (configured, or a signer)
+              // leaves only its public half on disk.
+              if (account_key) saveAccount({ url: acct.url, jwk: account_key.jwk });
+              else saveAccount({ key: acct.key, url: acct.url });
             });
 
             current_order.on('dns', function(records, done) {
@@ -454,6 +680,11 @@ function Manager(options) {
 
             current_order.on('tls-alpn', function(records, done) {
               ev.emit('tls-alpn', domain, records, done);
+            });
+
+            // The CA is still deciding - an approval, a slow signer (EST 202, ACME 'processing')
+            current_order.on('pending', function(info) {
+              ev.emit('pending', domain, info);
             });
 
             current_order.on('certificate', function(cert) {
@@ -493,14 +724,17 @@ function Manager(options) {
             current_order.start();
           });
         });
-      });
-    });
   }
 
 
   // --- Check all domains ---
 
   function checkAll() {
+    // Called by its own timer, and directly by add() / start(). A direct
+    // call must cancel the pending timer, not only forget it: a forgotten
+    // timer cannot be cleared by stop(), and kept the process alive for up
+    // to checkInterval after shutdown.
+    if (check_timer) clearTimeout(check_timer);
     check_timer = null;
     if (stopped) return;
 
@@ -538,7 +772,28 @@ function Manager(options) {
         let row = parseCsvLine(lines[i]);
         if (!row) continue;
 
+        // Renewed by its source, not here — only watched.
+        if (row.status === 'external') {
+          warnIfExternalDue(row, now);
+          continue;
+        }
+
         if (!row.issued_at || row.status === 'pending') {
+          // Never issued. The first attempt goes at once — but a failed one
+          // is still a failure, and waits like any other.
+          //
+          // Without this check a domain that had never been issued bypassed
+          // the retry interval entirely, and since a finished attempt
+          // schedules the next scan 100ms later, a failing one (a rejected
+          // contact address, a port the CA cannot reach) was retried several
+          // times a second, indefinitely. Against production that exhausts
+          // Let's Encrypt's per-IP account and failed-validation limits within
+          // minutes, and locks the machine out for hours — for a problem that
+          // needed fixing, not retrying. renewNow() still forces an attempt.
+          if (row.status === 'error' && row.last_attempt &&
+              now.getTime() - new Date(row.last_attempt).getTime() < config.retryInterval) {
+            continue;
+          }
           candidates.push({ domain: row.domain, last_attempt: row.last_attempt });
           continue;
         }
@@ -676,7 +931,7 @@ function Manager(options) {
             data.issued_at = dates.issued;
             data.expires_at = dates.expires;
           }
-          data.status = 'active';
+          data.status = data.external ? 'external' : 'active';
         } else {
           data.status = 'pending';
         }
@@ -685,6 +940,74 @@ function Manager(options) {
       });
     },
     list: function(callback) { readCsv(callback); },
+
+    /**
+     * Keep a certificate issued somewhere else.
+     *
+     *   mgr.store('example.com', { cert, key, ca }, function(err, result) { ... })
+     *
+     * Checked before anything is written: the key must belong to the
+     * certificate, the certificate must cover the name, and it must not have
+     * expired. A certificate older than the one already stored is ignored, so
+     * pushes arriving out of order cannot roll it back.
+     *
+     * Stored as external: served and delivered exactly like an issued one —
+     * 'certificate' fires, with { external: true } as a third argument — but
+     * never renewed here. The source keeps it current by storing newer ones.
+     * A domain this manager was issuing for becomes external too; storing is
+     * the caller saying who owns the name from now on.
+     *
+     * result: { stored: true, expiresAt } or { stored: false, reason }
+     */
+    store: function(domain, pem, callback) {
+      callback = callback || function() {};
+      domain = normDomain(domain);
+
+      let check = checkExternalCert(domain, pem);
+      if (check.error) { setImmediate(callback, check.error); return; }
+
+      ensureDir(function() {
+        // An issuance in flight for this name is superseded
+        if (current === domain) {
+          if (current_order) { current_order.abort(); current_order = null; }
+          if (current_timeout) { clearTimeout(current_timeout); current_timeout = null; }
+          current = null;
+        }
+
+        loadCert(domain, function(e, existing) {
+          if (existing && existing.cert) {
+            if (existing.cert === pem.cert && existing.external) {
+              return callback(null, { stored: false, reason: 'unchanged' });
+            }
+            let prev = getCertDates(existing.cert);
+            if (prev && prev.expires.getTime() > check.expires.getTime()) {
+              return callback(null, { stored: false, reason: 'older than the stored certificate' });
+            }
+          }
+
+          let ca = normCa(pem.ca);
+          saveCert(domain, {
+            domain: domain, external: true,
+            cert: pem.cert, key: pem.key, ca: ca,
+          }, function(serr) {
+            if (serr) return callback(serr);
+            updateCsvRow(domain, {
+              status: 'external',
+              issued_at: check.issued.toISOString(),
+              expires_at: check.expires.toISOString(),
+              renew_after: '', last_attempt: '', last_error: '',
+            }, function(werr) {
+              if (werr) return callback(werr);
+              delete external_warned[domain];
+              ev.emit('certificate', domain,
+                { cert: pem.cert, key: pem.key, ca: ca, expiresAt: check.expires },
+                { external: true });
+              callback(null, { stored: true, expiresAt: check.expires });
+            });
+          });
+        });
+      });
+    },
 
     renewNow: function(domain) {
       domain = normDomain(domain);

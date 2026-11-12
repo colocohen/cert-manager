@@ -2,15 +2,15 @@
 import * as crypto from 'node:crypto';
 import * as net from 'node:net';
 import { domainToASCII } from 'node:url';
-import {
-  SEQUENCE, SET, INTEGER, BIT_STRING, OCTET_STRING, OID, UTF8STRING, IA5STRING,
-  PRINTABLESTRING, ASN1_NULL, BOOLEAN, UTCTIME, EXPLICIT, read_tlv,
-  encode_tag,
-  OID_COMMON_NAME, OID_COUNTRY, OID_STATE, OID_LOCALITY, OID_ORGANIZATION, OID_ORG_UNIT,
-  OID_EMAIL, OID_SAN, OID_EXTENSION_REQUEST, OID_ACME_IDENTIFIER,
-  OID_ECDSA_SHA256, OID_ECDSA_SHA384, OID_SHA256_RSA,
-  OID_EC_PUBLIC_KEY, OID_RSA_PUBLIC_KEY, OID_P256, OID_P384,
-} from './asn1.js';
+import { jws, x509, x509_build, csr_build, pem } from 'cryptographic-formats';
+import { isSigner, loadKey, jwkThumbprint, publicJwk } from './signer.js';
+import { readCert } from './certs.js';
+
+
+// The bytes of every structure below - CSR, certificate, JWS - are written
+// by cryptographic-formats (the formats) and signed here or by the caller's signer
+// (the cryptography). cryptographic-formats hands back exactly the bytes to sign,
+// so what is signed is never a re-encoding of what is sent.
 
 
 /**
@@ -57,22 +57,12 @@ function generateKey(type, options) {
 
 
 /**
- * Get JWK thumbprint from a PEM private key (for ACME account key).
- * Returns the JWK public key object.
+ * The public JWK of an account key - a PEM private key, or a signer (its
+ * publicKey). Only the public members, in RFC 7638's set.
  */
-function getJwk(pem_private_key) {
-  let key_obj = crypto.createPrivateKey(pem_private_key);
-  let jwk = key_obj.export({ format: 'jwk' });
-
-  // Return only public components
-  if (jwk.kty === 'EC') {
-    return { kty: 'EC', crv: jwk.crv, x: jwk.x, y: jwk.y };
-  }
-  if (jwk.kty === 'RSA') {
-    return { kty: 'RSA', n: jwk.n, e: jwk.e };
-  }
-
-  return jwk;
+function getJwk(key) {
+  if (isSigner(key)) return loadKey(key, { use: 'account' }).jwk;
+  return publicJwk(crypto.createPublicKey(crypto.createPrivateKey(key)));
 }
 
 
@@ -80,18 +70,10 @@ function getJwk(pem_private_key) {
  * JWK thumbprint (RFC 7638) — used for challenge key authorizations.
  */
 function getJwkThumbprint(jwk) {
-  let ordered = null;
-
-  if (jwk.kty === 'EC') {
-    ordered = JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y });
-  } else if (jwk.kty === 'RSA') {
-    ordered = JSON.stringify({ e: jwk.e, kty: jwk.kty, n: jwk.n });
-  } else {
-    throw new Error('Unsupported JWK key type: ' + jwk.kty + ' (supported: EC, RSA)');
+  if (!jwk || (jwk.kty !== 'EC' && jwk.kty !== 'RSA')) {
+    throw new Error('Unsupported JWK key type: ' + (jwk && jwk.kty) + ' (supported: EC, RSA)');
   }
-
-  let hash = crypto.createHash('sha256').update(ordered).digest();
-  return base64url(hash);
+  return jwkThumbprint(jwk);
 }
 
 
@@ -230,41 +212,21 @@ function ipToArpa(ip) {
 
 
 /**
- * Build a SAN (Subject Alternative Name) extension DER for CSR.
- * names: array of domain strings and/or IP address strings.
- * Domains → dNSName (context tag [2], ASCII/punycode).
- * IPs     → iPAddress (context tag [7], raw 4/16 bytes per RFC 5280).
+ * A SAN entry as cryptographic-formats takes it. IPs go as raw bytes (4 or 16,
+ * RFC 5280) - ipToBytes has already dropped any zone index, which has no
+ * place in a certificate. Domains go as ASCII (punycode for IDN).
  */
-function buildSanExtension(names) {
-  let parts = [];
-  for (let i = 0; i < names.length; i++) {
-    if (net.isIP(names[i])) {
-      parts.push(encode_tag(0x87, ipToBytes(names[i])));
-    } else {
-      // dNSName is context tag [2], implicit — must be ASCII (punycode for IDN)
-      let encoded = new TextEncoder().encode(toAsciiDomain(names[i]));
-      parts.push(encode_tag(0x82, encoded));
-    }
-  }
-  let total = 0;
-  for (let i = 0; i < parts.length; i++) total += parts[i].length;
-  let content = new Uint8Array(total);
-  let off = 0;
-  for (let i = 0; i < parts.length; i++) {
-    content.set(parts[i], off);
-    off += parts[i].length;
-  }
-  return SEQUENCE([ content ]);
+function sanEntry(name) {
+  if (net.isIP(name)) return { ip: ipToBytes(name) };
+  return { dns: toAsciiDomain(name) };
 }
 
 
 /**
- * Create a CSR (Certificate Signing Request).
- * options: { commonName, altNames: [], emailAddress }
- * private_key_pem: PEM private key string
- * Returns DER Uint8Array.
+ * The CSR's parts: the subject and SANs from the options, the key's public
+ * half and algorithm. Shared by the sync (PEM) and async (signer) paths.
  */
-function createCsr(options, private_key_pem) {
+function csrRequest(options, key) {
   let primary = options.commonName || options.domain || null;
   let altNames = (options.altNames || []).map(toAsciiDomain);
   let emailAddress = options.emailAddress || null;
@@ -281,27 +243,14 @@ function createCsr(options, private_key_pem) {
     throw new Error('createCsr requires at least one name (commonName/domain/altNames)');
   }
 
-  let key_obj = crypto.createPrivateKey(private_key_pem);
-  let key_type = key_obj.asymmetricKeyType; // 'ec' or 'rsa'
-  let pub_obj = crypto.createPublicKey(key_obj);
-  let pub_der = pub_obj.export({ type: 'spki', format: 'der' });
-
-  // Build subject
-  let subject_parts = [];
+  let subject = [];
 
   // CN — only for domain names, and only when we have one.
   // IP addresses never go into the CN: CAs omit the CN for IP certificates
   // (Let's Encrypt's tlsserver/shortlived profiles contain no CN at all),
   // and an IP belongs in the SAN as iPAddress bytes, not as Subject text.
   // PKCS#10 permits an empty subject when a SAN extension is present.
-  if (primary && !net.isIP(primary)) {
-    subject_parts.push(SET([
-      SEQUENCE([
-        OID(OID_COMMON_NAME),
-        UTF8STRING(primary),
-      ])
-    ]));
-  }
+  if (primary && !net.isIP(primary)) subject.push({ commonName: primary });
 
   // Country (C) — X.520 mandates PrintableString of exactly 2 characters
   if (options.country) {
@@ -309,104 +258,61 @@ function createCsr(options, private_key_pem) {
     if (!/^[A-Z]{2}$/.test(country)) {
       throw new Error('country must be a 2-letter ISO 3166 code (got "' + options.country + '")');
     }
-    subject_parts.push(SET([ SEQUENCE([ OID(OID_COUNTRY), PRINTABLESTRING(country) ]) ]));
+    subject.push({ countryName: country });
   }
+  if (options.state) subject.push({ stateOrProvinceName: options.state });
+  if (options.locality) subject.push({ localityName: options.locality });
+  if (options.organization) subject.push({ organizationName: options.organization });
+  if (options.organizationUnit) subject.push({ organizationalUnitName: options.organizationUnit });
+  if (emailAddress) subject.push({ emailAddress: emailAddress });
 
-  // State (ST)
-  if (options.state) {
-    subject_parts.push(SET([ SEQUENCE([ OID(OID_STATE), UTF8STRING(options.state) ]) ]));
-  }
+  return csr_build.prepare({
+    subject: subject,
+    public_key: key.spki,
+    signature_algorithm: key.alg.x509,
+    extensions: { subjectAltName: altNames.map(sanEntry) },
+  });
+}
 
-  // Locality (L)
-  if (options.locality) {
-    subject_parts.push(SET([ SEQUENCE([ OID(OID_LOCALITY), UTF8STRING(options.locality) ]) ]));
-  }
 
-  // Organization (O)
-  if (options.organization) {
-    subject_parts.push(SET([ SEQUENCE([ OID(OID_ORGANIZATION), UTF8STRING(options.organization) ]) ]));
-  }
-
-  // Organizational Unit (OU)
-  if (options.organizationUnit) {
-    subject_parts.push(SET([ SEQUENCE([ OID(OID_ORG_UNIT), UTF8STRING(options.organizationUnit) ]) ]));
-  }
-
-  // emailAddress
-  if (emailAddress) {
-    subject_parts.push(SET([
-      SEQUENCE([
-        OID(OID_EMAIL),
-        IA5STRING(emailAddress),
-      ])
-    ]));
-  }
-
-  let subject = SEQUENCE(subject_parts);
-
-  // Build SAN extension
-  let san_ext = buildSanExtension(altNames);
-
-  // Extension request attribute (PKCS#10 extensionRequest)
-  let ext_request = EXPLICIT(0,
-    SEQUENCE([
-      OID(OID_EXTENSION_REQUEST),
-      SET([
-        SEQUENCE([
-          SEQUENCE([
-            OID(OID_SAN),
-            OCTET_STRING(san_ext),
-          ])
-        ])
-      ])
-    ])
-  );
-
-  // CertificationRequestInfo
-  let cri = SEQUENCE([
-    INTEGER(0), // version
-    subject,
-    new Uint8Array(pub_der), // SubjectPublicKeyInfo
-    ext_request,
-  ]);
-
-  // Sign
-  let sig_alg_oid = null;
-  let hash_alg = 'sha256';
-
-  if (key_type === 'ec') {
-    let jwk = key_obj.export({ format: 'jwk' });
-    if (jwk.crv === 'P-384') {
-      sig_alg_oid = OID_ECDSA_SHA384;
-      hash_alg = 'sha384';
-    } else {
-      sig_alg_oid = OID_ECDSA_SHA256;
-      hash_alg = 'sha256';
+/**
+ * Create a CSR (Certificate Signing Request).
+ *
+ *   createCsr(options, privateKeyPem)                  → DER Uint8Array (as before)
+ *   createCsr(options, privateKeyPemOrSigner, callback) → callback(err, der)
+ *
+ * options: { commonName, altNames: [], emailAddress, country, state,
+ *            locality, organization, organizationUnit }
+ * The callback form also takes a signer { publicKey, sign, ... } - the
+ * certificate's key held in an HSM or KMS (see signer.js).
+ */
+function createCsr(options, private_key, callback) {
+  if (typeof callback === 'function') {
+    let key, prepared;
+    try {
+      key = loadKey(private_key, { use: 'certificate', signTimeout: options.signTimeout, signRetries: options.signRetries });
+      prepared = csrRequest(options, key);
+    } catch (e) {
+      return setImmediate(callback, e);
     }
-  } else {
-    sig_alg_oid = OID_SHA256_RSA;
-    hash_alg = 'sha256';
+    key.sign(prepared.bytes, 'der', function(err, sig) {
+      if (err) return callback(err);
+      let der;
+      try { der = csr_build.assemble(prepared, sig); } catch (e) { return callback(e); }
+      callback(null, der);
+    });
+    return;
   }
 
-  let signer = crypto.createSign(hash_alg);
-  signer.update(cri);
-  let signature = signer.sign(key_obj);
+  if (isSigner(private_key)) {
+    throw new Error('createCsr: a signer signs asynchronously - pass a callback: createCsr(options, signer, function(err, der) {})');
+  }
 
-  // AlgorithmIdentifier:
-  //  - ECDSA (RFC 5754 §3.3): parameters field MUST be absent
-  //  - RSA   (RFC 5754 §3.2): parameters field MUST be an explicit NULL
-  let sig_alg = (key_type === 'ec')
-    ? SEQUENCE([OID(sig_alg_oid)])
-    : SEQUENCE([OID(sig_alg_oid), ASN1_NULL()]);
-
-  // Build CSR
-  let csr = SEQUENCE([
-    cri,
-    sig_alg,
-    BIT_STRING(new Uint8Array(signature)),
-  ]);
-
-  return csr;
+  let key_obj = crypto.createPrivateKey(private_key);
+  let key = loadKey(private_key, { use: 'certificate' });
+  let prepared = csrRequest(options, key);
+  let sig = crypto.sign(key.alg.hash, Buffer.from(prepared.bytes), key_obj);   // DER for ECDSA, as X.509 wants
+  return csr_build.assemble(prepared, new Uint8Array(sig));
 }
 
 
@@ -429,6 +335,7 @@ function createCsr(options, private_key_pem) {
  *    is itself an OCTET STRING (RFC 5280), the wire bytes are a DOUBLE
  *    OCTET STRING: 04 22 04 20 <32 digest bytes>. One layer only = the
  *    classic implementation bug, and the CA rejects it without explanation.
+ *    cryptographic-formats writes the outer layer; the inner one (04 20 ...) is here.
  */
 function createAlpnCertificate(identifier, key_authorization) {
   // Fresh key just for the challenge cert — never reuse the account or
@@ -438,63 +345,38 @@ function createAlpnCertificate(identifier, key_authorization) {
   let pub_der = crypto.createPublicKey(key_obj).export({ type: 'spki', format: 'der' });
 
   let digest = crypto.createHash('sha256').update(key_authorization).digest();
-
-  // SAN — exactly one entry (RFC 8737: "and no other entries")
-  let san_entry = net.isIP(identifier)
-    ? encode_tag(0x87, ipToBytes(identifier))                          // iPAddress
-    : encode_tag(0x82, new TextEncoder().encode(toAsciiDomain(identifier))); // dNSName
-  let san_value = SEQUENCE([ san_entry ]);
+  let authorization = new Uint8Array(2 + digest.length);
+  authorization[0] = 0x04;                 // OCTET STRING
+  authorization[1] = digest.length;        // 32
+  authorization.set(digest, 2);
 
   // A short fixed CN for subject/issuer. RFC 8737 doesn't require an empty
   // subject, and RFC 5280 would force SAN to be critical if it were empty —
   // a non-empty name keeps strict parsers happy. (The identifier itself
   // can't be the CN: an ip6.arpa name exceeds the 64-char CN limit.)
-  let name = SEQUENCE([
-    SET([ SEQUENCE([ OID(OID_COMMON_NAME), UTF8STRING('ACME TLS-ALPN Challenge') ]) ])
-  ]);
+  let name = [{ commonName: 'ACME TLS-ALPN Challenge' }];
 
   let now = Date.now();
-  let validity = SEQUENCE([
-    UTCTIME(new Date(now - 5 * 60000)),        // 5 min back — clock skew
-    UTCTIME(new Date(now + 24 * 3600000)),     // challenges live minutes, 24h is plenty
-  ]);
+  let tbs = x509_build.prepare({
+    serial: crypto.randomBytes(12),
+    issuer: name,
+    subject: name,
+    validity: {
+      not_before: new Date(now - 5 * 60000),        // 5 min back — clock skew
+      not_after: new Date(now + 24 * 3600000),      // challenges live minutes, 24h is plenty
+    },
+    public_key: new Uint8Array(pub_der),
+    signature_algorithm: 'ecdsaWithSHA256',
+    extensions: {
+      // SAN — exactly one entry (RFC 8737: "and no other entries")
+      subjectAltName: [sanEntry(identifier)],
+      // acmeIdentifier — MUST be critical
+      '1.3.6.1.5.5.7.1.31': { value: authorization, critical: true },
+    },
+  });
 
-  // Extension ::= SEQUENCE { extnID, critical BOOLEAN, extnValue OCTET STRING }
-  let extensions = EXPLICIT(3, SEQUENCE([
-    // subjectAltName — non-critical (subject is non-empty)
-    SEQUENCE([ OID(OID_SAN), OCTET_STRING(san_value) ]),
-    // acmeIdentifier — MUST be critical; note the double OCTET STRING
-    SEQUENCE([
-      OID(OID_ACME_IDENTIFIER),
-      BOOLEAN(true),
-      OCTET_STRING( OCTET_STRING(new Uint8Array(digest)) ),
-    ]),
-  ]));
-
-  let sig_alg = SEQUENCE([ OID(OID_ECDSA_SHA256) ]);  // EC: parameters absent (RFC 5754)
-
-  let serial = new Uint8Array(crypto.randomBytes(12));
-
-  let tbs = SEQUENCE([
-    EXPLICIT(0, INTEGER(2)),      // version v3
-    INTEGER(serial),
-    sig_alg,
-    name,                          // issuer (self-signed)
-    validity,
-    name,                          // subject
-    new Uint8Array(pub_der),       // SubjectPublicKeyInfo
-    extensions,
-  ]);
-
-  let signer = crypto.createSign('sha256');
-  signer.update(tbs);
-  let signature = signer.sign(key_obj);
-
-  let cert_der = SEQUENCE([
-    tbs,
-    sig_alg,
-    BIT_STRING(new Uint8Array(signature)),
-  ]);
+  let signature = crypto.sign('sha256', Buffer.from(tbs.bytes), key_obj);
+  let cert_der = x509_build.assemble(tbs, new Uint8Array(signature));
 
   return {
     cert: pemEncode(cert_der, 'CERTIFICATE'),
@@ -504,52 +386,57 @@ function createAlpnCertificate(identifier, key_authorization) {
 
 
 /**
- * Sign data with JWS (JSON Web Signature) for ACME requests.
- * payload: object or empty string (for POST-as-GET)
- * protected_header: object
- * private_key_pem: PEM private key string
- * Returns { protected, payload, signature } object ready for JSON.
+ * The JWS parts for an ACME request: payload '' for POST-as-GET, anything
+ * else as JSON. A header without `alg` gets the key's.
  */
-function signJws(payload, protected_header, private_key_pem) {
-  let key_obj = crypto.createPrivateKey(private_key_pem);
-  let key_type = key_obj.asymmetricKeyType;
-
-  let protected_b64 = base64url(Buffer.from(JSON.stringify(protected_header)));
-
-  let payload_b64 = '';
-  if (payload === '') {
-    payload_b64 = '';
-  } else {
-    payload_b64 = base64url(Buffer.from(JSON.stringify(payload)));
+function jwsRequest(payload, protected_header, key) {
+  let header = protected_header;
+  if (header.alg === undefined) {
+    header = Object.assign({ alg: key.alg.jws }, protected_header);
   }
+  let body = (payload === '') ? '' : JSON.stringify(payload);
+  return jws.prepare(header, body);
+}
 
-  let signing_input = protected_b64 + '.' + payload_b64;
 
-  // Hash must match the JWS "alg" header (see getAlgFromKey in http.js):
-  // P-256 → ES256/sha256, P-384 → ES384/sha384, P-521 → ES512/sha512, RSA → RS256/sha256
-  let alg = 'sha256';
-  if (key_type === 'ec') {
-    let jwk = key_obj.export({ format: 'jwk' });
-    if (jwk.crv === 'P-384') alg = 'sha384';
-    else if (jwk.crv === 'P-521') alg = 'sha512';
-    else if (jwk.crv !== 'P-256') {
-      throw new Error('Unsupported EC curve for JWS: ' + jwk.crv);
+/**
+ * Sign data with JWS (JSON Web Signature) for ACME requests.
+ *
+ *   signJws(payload, header, privateKeyPem)                  → { protected, payload, signature }
+ *   signJws(payload, header, privateKeyPemOrSigner, callback) → callback(err, jws)
+ *
+ * payload: object or empty string (for POST-as-GET)
+ * The callback form also takes a signer (see signer.js). ECDSA signatures
+ * are the raw r||s pair JOSE requires - converted from DER if the signer
+ * returns that.
+ */
+function signJws(payload, protected_header, private_key, callback) {
+  if (typeof callback === 'function') {
+    let key, prepared;
+    try {
+      key = loadKey(private_key, { use: 'account' });
+      prepared = jwsRequest(payload, protected_header, key);
+    } catch (e) {
+      return setImmediate(callback, e);
     }
+    key.sign(prepared.bytes, 'raw', function(err, sig) {
+      if (err) return callback(err);
+      let out;
+      try { out = jws.assemble(prepared, sig, { serialization: 'flattened' }); } catch (e) { return callback(e); }
+      callback(null, out);
+    });
+    return;
   }
 
-  let signer = crypto.createSign(alg);
-  signer.update(signing_input);
+  if (isSigner(private_key)) {
+    throw new Error('signJws: a signer signs asynchronously - pass a callback: signJws(payload, header, signer, function(err, jws) {})');
+  }
 
-  let sig = signer.sign({
-    key: key_obj,
-    dsaEncoding: 'ieee-p1363',
-  });
-
-  return {
-    protected: protected_b64,
-    payload: payload_b64,
-    signature: base64url(sig),
-  };
+  let key_obj = crypto.createPrivateKey(private_key);
+  let key = loadKey(private_key, { use: 'account' });
+  let prepared = jwsRequest(payload, protected_header, key);
+  let sig = crypto.sign(key.alg.hash, Buffer.from(prepared.bytes), { key: key_obj, dsaEncoding: 'ieee-p1363' });
+  return jws.assemble(prepared, new Uint8Array(sig), { serialization: 'flattened' });
 }
 
 
@@ -581,26 +468,30 @@ function base64url(data) {
  * account_jwk: object (public JWK of account key)
  * url: string (newAccount URL)
  * Returns { protected, payload, signature } JWS object.
+ *
+ * An HMAC with the CA's key, not a signature - the account key is never
+ * involved, so this stays synchronous even when the account key is a signer.
  */
 function signEab(eab_kid, eab_hmac_key, account_jwk, url) {
-  let protected_header = {
-    alg: 'HS256',
-    kid: eab_kid,
-    url: url,
-  };
-
-  let protected_b64 = base64url(Buffer.from(JSON.stringify(protected_header)));
-  let payload_b64 = base64url(Buffer.from(JSON.stringify(account_jwk)));
-
-  let signing_input = protected_b64 + '.' + payload_b64;
+  let prepared = jws.prepare({ alg: 'HS256', kid: eab_kid, url: url }, JSON.stringify(account_jwk));
+  // RFC 8555 §7.3.4 says base64url; some CAs hand out standard base64.
+  // Node's 'base64' decoder reads both alphabets.
   let hmac_key = Buffer.from(eab_hmac_key, 'base64');
-  let sig = crypto.createHmac('sha256', hmac_key).update(signing_input).digest();
+  let mac = crypto.createHmac('sha256', hmac_key).update(Buffer.from(prepared.bytes)).digest();
+  return jws.assemble(prepared, new Uint8Array(mac), { serialization: 'flattened' });
+}
 
-  return {
-    protected: protected_b64,
-    payload: payload_b64,
-    signature: base64url(sig),
-  };
+
+/**
+ * The first certificate's DER, from PEM (a chain is fine) or DER bytes.
+ */
+function firstCertificateDer(cert_pem_or_der) {
+  if (typeof cert_pem_or_der !== 'string') return new Uint8Array(cert_pem_or_der);
+  let blocks = pem.decode(cert_pem_or_der);
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].label === 'CERTIFICATE') return blocks[i].der;
+  }
+  throw new Error('no CERTIFICATE block');
 }
 
 
@@ -616,64 +507,12 @@ function signEab(eab_kid, eab_hmac_key, account_jwk, url) {
  * case ARI simply isn't applicable.
  */
 function getAriCertId(cert_pem_or_der) {
-  let der = null;
-  if (typeof cert_pem_or_der === 'string') {
-    let b64 = cert_pem_or_der.replace(/-----[A-Z ]+-----/g, '').replace(/[\r\n\s]/g, '');
-    der = new Uint8Array(Buffer.from(b64, 'base64'));
-  } else {
-    der = new Uint8Array(cert_pem_or_der);
-  }
-
   try {
-    let cert = read_tlv(der, 0);           // Certificate ::= SEQUENCE
-    let tbs = read_tlv(der, cert.start);   // tbsCertificate ::= SEQUENCE
-
-    let off = tbs.start;
-    let first = read_tlv(der, off);
-    if (first.tag === 0xA0) off = first.next;   // [0] EXPLICIT version (v3)
-
-    let serial_tlv = read_tlv(der, off);        // serialNumber INTEGER
-    let serial = der.slice(serial_tlv.start, serial_tlv.end);
-
-    // Walk the remaining TBS fields to the extensions container [3]
-    let p = serial_tlv.next;
-    let ext_container = null;
-    while (p < tbs.end) {
-      let t = read_tlv(der, p);
-      if (t.tag === 0xA3) { ext_container = t; break; }
-      p = t.next;
-    }
-    if (!ext_container) return null;
-
-    let exts = read_tlv(der, ext_container.start);   // SEQUENCE OF Extension
-    let q = exts.start;
-    while (q < exts.end) {
-      let ext = read_tlv(der, q);                    // Extension ::= SEQUENCE
-      let oid = read_tlv(der, ext.start);
-      // authorityKeyIdentifier = OID 2.5.29.35 = 55 1D 23
-      let is_aki = (oid.tag === 0x06 && (oid.end - oid.start) === 3 &&
-                    der[oid.start] === 0x55 && der[oid.start + 1] === 0x1D && der[oid.start + 2] === 0x23);
-      if (is_aki) {
-        let r = oid.next;
-        let val = read_tlv(der, r);
-        if (val.tag === 0x01) { val = read_tlv(der, val.next); }   // skip critical BOOLEAN if present
-        // val = extnValue OCTET STRING → AuthorityKeyIdentifier ::= SEQUENCE
-        let inner = read_tlv(der, val.start);
-        let s = inner.start;
-        while (s < inner.end) {
-          let f = read_tlv(der, s);
-          if (f.tag === 0x80) {                       // [0] IMPLICIT keyIdentifier
-            let aki = der.slice(f.start, f.end);
-            if (aki.length === 0 || serial.length === 0) return null;
-            return base64url(aki) + '.' + base64url(serial);
-          }
-          s = f.next;
-        }
-        return null;
-      }
-      q = ext.next;
-    }
-    return null;
+    let cert = x509.from_der(firstCertificateDer(cert_pem_or_der));
+    let aki = x509.extension(cert, 'authorityKeyId');
+    let key_id = aki && aki.parsed ? aki.parsed.key_id : null;
+    if (!key_id || key_id.length === 0 || !cert.serial || cert.serial.length === 0) return null;
+    return base64url(key_id) + '.' + base64url(cert.serial);
   } catch (e) {
     return null;
   }
@@ -681,31 +520,38 @@ function getAriCertId(cert_pem_or_der) {
 
 
 /**
- * Extract validity dates from a certificate PEM.
+ * Extract validity dates from a certificate PEM (its first certificate,
+ * read by cryptographic-formats).
  * Returns { issued: Date, expires: Date } or null on parse failure.
  * (Single source of truth — used by both the order engine and the manager.)
  */
 function getCertDates(cert_pem) {
   try {
-    let x509 = new crypto.X509Certificate(cert_pem);
-    return { issued: new Date(x509.validFrom), expires: new Date(x509.validTo) };
+    let cert = readCert(cert_pem);
+    return { issued: new Date(cert.notBefore.getTime()), expires: new Date(cert.notAfter.getTime()) };
   } catch (e) { return null; }
 }
 
 
 /**
- * Encode DER bytes as PEM with the given label.
+ * Encode DER bytes as PEM with the given label (cryptographic-formats, RFC 7468).
  * pemEncode(der, 'CERTIFICATE REQUEST') → '-----BEGIN CERTIFICATE REQUEST-----\n...'
  * Strings are returned unchanged (assumed to already be PEM).
  */
 function pemEncode(der, label) {
   if (typeof der === 'string') return der;
-  let b64 = Buffer.from(der).toString('base64');
-  let lines = [];
-  for (let i = 0; i < b64.length; i += 64) {
-    lines.push(b64.substring(i, i + 64));
-  }
-  return '-----BEGIN ' + label + '-----\n' + lines.join('\n') + '\n-----END ' + label + '-----\n';
+  return pem.encode(der, label);
+}
+
+
+/**
+ * A CSR as DER, from what a caller may hand in: DER bytes, or PEM text.
+ * (A PEM string used to be base64url'd as text and sent to the CA as is -
+ * which no CA accepts.)
+ */
+function csrToDer(csr) {
+  if (typeof csr !== 'string') return new Uint8Array(csr);
+  return pem.decode_one(csr, 'CERTIFICATE REQUEST').der;
 }
 
 
@@ -725,4 +571,5 @@ export {
   createAlpnCertificate,
   getAriCertId,
   getCertDates,
+  csrToDer,
 };

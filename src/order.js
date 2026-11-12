@@ -3,14 +3,20 @@ import { EventEmitter } from 'node:events';
 import * as nodeCrypto from 'node:crypto';
 import * as net from 'node:net';
 import { AcmeHttp } from './http.js';
-import { generateKey, getJwk, getJwkThumbprint, createCsr, signJws, signEab, base64url, pemEncode, toAsciiDomain, ipToArpa, canonicalIp, createAlpnCertificate, getCertDates } from './crypto.js';
+import { generateKey, createCsr, signEab, base64url, pemEncode, toAsciiDomain, ipToArpa, canonicalIp, createAlpnCertificate, getCertDates, csrToDer } from './crypto.js';
+import { certificatePems } from './certs.js';
+import { loadKey, isSigner } from './signer.js';
 import { verifyDnsChallenge, verifyHttpChallenge, checkCaa } from './verify.js';
-import { PROVIDERS } from './providers.js';
+import { resolveProvider } from './providers.js';
+import EstOrder from './est.js';
 
 
 function Order(options) {
-  if (!(this instanceof Order)) return new Order(options);
   options = options || {};
+  // An EST provider: the same order, over RFC 7030 - same options where they
+  // apply, same 'certificate' and 'error' events, same methods.
+  if (options.provider && typeof options.provider === 'object' && options.provider.est) return new EstOrder(options);
+  if (!(this instanceof Order)) return new Order(options);
 
   const ev = new EventEmitter();
 
@@ -25,10 +31,24 @@ function Order(options) {
     provider: options.provider || 'letsencrypt',
     staging: !!options.staging,
 
+    // Each key is a PEM string, or a signer { publicKey, sign, ... } when
+    // the key lives elsewhere (an HSM, a KMS, a remote signing service) -
+    // see signer.js.
     accountKey: options.accountKey || null,
     accountUrl: options.accountUrl || null,  // known account URL — skips newAccount round-trip
     privateKey: options.privateKey || null,
     csr: options.csr || null,
+
+    // A signer may be slow (a remote service, a human approval) or refuse.
+    // signTimeout bounds one signature; a timeout, or an error the signer
+    // marks retryable, is retried signRetries times. A refusal never is.
+    signTimeout: options.signTimeout || 60000,
+    signRetries: (options.signRetries >= 0) ? options.signRetries : 2,
+
+    // The keys above, loaded once (signer.loadKey) - what actually signs
+    _account: null,
+    _cert_key: null,
+    _csr_building: false,
 
     // Challenge type: 'dns-01' (default) | 'http-01' | 'tls-alpn-01'.
     // dns-01 is forbidden for IP identifiers (RFC 8738) — validated in start().
@@ -169,6 +189,14 @@ function Order(options) {
     context._validating_running = false;
     context._ready_running = false;
     context._processing_running = false;
+    context._csr_building = false;
+  }
+
+  // A signature that failed (refused, timed out, invalid) is not a network
+  // blip: the polling loops below retry those, but repeating a request the
+  // signer refused would only ask it again every few seconds, forever.
+  function isSignError(err) {
+    return !!err && typeof err.code === 'string' && err.code.indexOf('SIGN_') === 0;
   }
 
   function emitError(err, step) {
@@ -302,18 +330,40 @@ function Order(options) {
       }
 
 
+      // --- load keys (PEM or signer), once ---
+      // User-supplied keys were already checked in start(); a failure here
+      // can only be a generated key, which would be a bug - still reported.
+
+      try {
+        if (context._account === null && context.accountKey !== null) {
+          context._account = loadKey(context.accountKey, {
+            use: 'account', signTimeout: context.signTimeout, signRetries: context.signRetries });
+        }
+        if (context._cert_key === null && context.privateKey !== null) {
+          context._cert_key = loadKey(context.privateKey, {
+            use: 'certificate', signTimeout: context.signTimeout, signRetries: context.signRetries });
+        }
+      } catch (e) {
+        emitError(e, 'options');
+        return;
+      }
+
+
       // --- generate JWK ---
 
-      if (context.jwk === null && context.accountKey !== null) {
-        let jwk = getJwk(context.accountKey);
-        params_to_set['jwk'] = jwk;
-        params_to_set['jwk_thumbprint'] = getJwkThumbprint(jwk);
+      if (context.jwk === null && context._account !== null) {
+        params_to_set['jwk'] = context._account.jwk;
+        params_to_set['jwk_thumbprint'] = context._account.thumbprint;
       }
 
 
       // --- generate CSR ---
+      // Asynchronous: the certificate's key may be a signer (an HSM). It
+      // runs beside the ACME flow; finalizing waits for context.csr, so a
+      // slow signature only delays the step that needs it.
 
-      if (context.csr === null && context.csr_generated === false && context.privateKey !== null && context.domain !== null) {
+      if (context.csr === null && context.csr_generated === false && context._cert_key !== null && context.domain !== null && context._csr_building === false) {
+        context._csr_building = true;
         let alt = [];
         if (context.domain) alt.push(context.domain);
         if (context.wildcard) alt.push('*.' + context.domain);
@@ -337,10 +387,20 @@ function Order(options) {
         if (extra.organization) csr_opts.organization = extra.organization;
         if (extra.organizationUnit) csr_opts.organizationUnit = extra.organizationUnit;
 
-        let csr_der = createCsr(csr_opts, context.privateKey);
-
-        params_to_set['csr'] = csr_der;
-        params_to_set['csr_generated'] = true;
+        createCsr(csr_opts, context._cert_key, function(err, csr_der) {
+          if (context.aborted) return;
+          context._csr_building = false;
+          if (err) {
+            // The CSR runs beside the ACME requests, so some may still be in
+            // flight. Their callbacks would otherwise carry the flow past
+            // the error (state 'order', 'challenges', ...) with nobody
+            // listening. Halt them: the order is over.
+            emitError(err, 'csr');
+            context.aborted = true;
+            return;
+          }
+          set_context({ csr: csr_der, csr_generated: true });
+        });
       }
 
 
@@ -354,8 +414,7 @@ function Order(options) {
       // --- init HTTP client ---
 
       if (context.http === null && context.state !== 'new') {
-        let provider = PROVIDERS[context.provider] || PROVIDERS.letsencrypt;
-        let dir_url = context.staging ? provider.staging : provider.production;
+        let dir_url = context._provider.directory;
         if (!dir_url) dir_url = provider.production;
         context.http = new AcmeHttp(dir_url);
       }
@@ -379,11 +438,14 @@ function Order(options) {
         if (net.isIP(context.domain)) {
           params_to_set['preflight_done'] = true;
           params_to_set['preflight_result'] = { caa: { skipped: 'ip-identifier' } };
+        } else if (!context._provider.caa) {
+          // Any ACME server ({ acme: url }) without its CAA identity: nothing to check against
+          params_to_set['preflight_done'] = true;
+          params_to_set['preflight_result'] = { caa: { skipped: 'no-ca-identity' } };
         } else {
           context._preflight_running = true;
 
-        let provider_info = PROVIDERS[context.provider] || PROVIDERS.letsencrypt;
-        let caa_domain = provider_info.caa || null;
+        let caa_domain = context._provider.caa;
 
         checkCaa(context.domain, caa_domain, { wildcard: context.wildcard }, function(err, caa) {
           if (context.aborted) return;
@@ -468,7 +530,7 @@ function Order(options) {
             );
           }
 
-          context.http.signedRequest(new_account_url, payload, context.accountKey, null, function(err, res) {
+          context.http.signedRequest(new_account_url, payload, context._account, null, function(err, res) {
             if (context.aborted) return;
             if (err) { emitError(err, 'account'); return; }
 
@@ -508,7 +570,7 @@ function Order(options) {
             order_payload.replaces = context.replaces;
           }
 
-          context.http.signedRequest(new_order_url, order_payload, context.accountKey, context.account_url, function(err, res) {
+          context.http.signedRequest(new_order_url, order_payload, context._account, context.account_url, function(err, res) {
             if (context.aborted) return;
             if (err) { emitError(err, 'order'); return; }
 
@@ -590,10 +652,11 @@ function Order(options) {
         } else {
 
           let auth_errors = [];
+          let auth_sign_error = null;     // a signer's refusal or timeout keeps its code
 
           for (let i = 0; i < auth_urls.length; i++) {
             (function(auth_url) {
-              context.http.signedRequest(auth_url, '', context.accountKey, context.account_url, function(err, res) {
+              context.http.signedRequest(auth_url, '', context._account, context.account_url, function(err, res) {
                 if (context.aborted) return;
 
                 if (!err && res.json) {
@@ -605,6 +668,7 @@ function Order(options) {
                   });
                 } else {
                   auth_errors.push(auth_url + ': ' + (err ? err.message : 'HTTP ' + (res ? res.status : '?')));
+                  if (isSignError(err) && !auth_sign_error) auth_sign_error = err;
                 }
 
                 auth_left--;
@@ -615,7 +679,7 @@ function Order(options) {
                     // A PARTIAL fetch must fail loudly. Proceeding with a
                     // subset would submit fewer challenges than the order
                     // requires — and then poll a forever-pending order.
-                    emitError(new Error('Failed to fetch ' + auth_errors.length + '/' + auth_urls.length + ' authorizations: ' + auth_errors.join('; ')), 'challenge');
+                    emitError(auth_sign_error || new Error('Failed to fetch ' + auth_errors.length + '/' + auth_urls.length + ' authorizations: ' + auth_errors.join('; ')), 'challenge');
                   }
                 }
               });
@@ -770,8 +834,7 @@ function Order(options) {
             });
           }
 
-          let provider_info = PROVIDERS[context.provider] || PROVIDERS.letsencrypt;
-          let caa_domain = provider_info.caa || null;
+          let caa_domain = context._provider.caa;
 
           // CAA records are OPTIONAL: per RFC 8659, absence of CAA means any CA
           // may issue. These are only a recommendation to restrict issuance —
@@ -927,10 +990,11 @@ function Order(options) {
           let submit_left = selected.length;
           let submit_results = [];
           let submit_errors = [];
+          let submit_sign_error = null;   // a signer's refusal or timeout keeps its code
 
           for (let i = 0; i < selected.length; i++) {
             (function(ch) {
-              context.http.signedRequest(ch.url, {}, context.accountKey, context.account_url, function(err, res) {
+              context.http.signedRequest(ch.url, {}, context._account, context.account_url, function(err, res) {
                 if (context.aborted) return;
 
                 let result = {
@@ -942,6 +1006,7 @@ function Order(options) {
                 };
                 submit_results.push(result);
                 if (err) submit_errors.push(ch.identifier.value + ': ' + err.message);
+                if (isSignError(err) && !submit_sign_error) submit_sign_error = err;
 
                 submit_left--;
                 if (submit_left <= 0) {
@@ -950,7 +1015,7 @@ function Order(options) {
                   if (submit_errors.length > 0) {
                     // Emit ONE error after the whole batch — emitting mid-loop
                     // would wedge the state machine while requests are in flight
-                    emitError(new Error('Failed to submit ' + submit_errors.length + '/' + selected.length + ' challenges: ' + submit_errors.join('; ')), 'challenge');
+                    emitError(submit_sign_error || new Error('Failed to submit ' + submit_errors.length + '/' + selected.length + ' challenges: ' + submit_errors.join('; ')), 'challenge');
                   } else {
                     set_context({ challenges_submitted: true, state: 'validating' });
                   }
@@ -998,8 +1063,16 @@ function Order(options) {
             for (let i = 0; i < challenge_urls.length; i++) {
               (function(ch_info) {
                 // POST-as-GET to challenge URL (same as acme-client waitForValidStatus)
-                context.http.signedRequest(ch_info.url, '', context.accountKey, context.account_url, function(err, res) {
+                context.http.signedRequest(ch_info.url, '', context._account, context.account_url, function(err, res) {
                   if (context.aborted) { context._validating_running = false; return; }
+                  if (isSignError(err)) {
+                    if (invalid === false) {
+                      invalid = true;
+                      context._validating_running = false;
+                      emitError(err, 'challenge');
+                    }
+                    return;
+                  }
 
                   let status = (err ? 'error' : (res.json ? res.json.status : 'unknown'));
                   statuses.push(ch_info.identifier + ':' + status);
@@ -1048,8 +1121,9 @@ function Order(options) {
             return;
           }
 
-          context.http.signedRequest(context.order_url, '', context.accountKey, context.account_url, function(err, res) {
+          context.http.signedRequest(context.order_url, '', context._account, context.account_url, function(err, res) {
             if (context.aborted) { context._ready_running = false; return; }
+            if (isSignError(err)) { context._ready_running = false; emitError(err, 'finalize'); return; }
 
             let status = (err ? 'error' : (res.json ? res.json.status : 'unknown'));
 
@@ -1084,7 +1158,15 @@ function Order(options) {
       if (context.state === 'finalizing' && context.order_ready === true && context.finalize_url !== null && context.csr !== null && context.order_finalized === false && context._finalizing_in_progress === false) {
         context._finalizing_in_progress = true;
 
-        context.http.signedRequest(context.finalize_url, { csr: base64url(context.csr) }, context.accountKey, context.account_url, function(err, res) {
+        let csr_der;
+        try {
+          csr_der = csrToDer(context.csr);   // a CSR given as PEM is sent as its DER
+        } catch (e) {
+          emitError(new Error('csr is not a PEM CERTIFICATE REQUEST or DER bytes: ' + e.message), 'finalize');
+          return;
+        }
+
+        context.http.signedRequest(context.finalize_url, { csr: base64url(csr_der) }, context._account, context.account_url, function(err, res) {
           if (context.aborted) return;
           if (err) { emitError(err, 'finalize'); return; }
 
@@ -1115,8 +1197,9 @@ function Order(options) {
             return;
           }
 
-          context.http.signedRequest(context.order_url, '', context.accountKey, context.account_url, function(err, res) {
+          context.http.signedRequest(context.order_url, '', context._account, context.account_url, function(err, res) {
             if (context.aborted) { context._processing_running = false; return; }
+            if (isSignError(err)) { context._processing_running = false; emitError(err, 'certificate'); return; }
 
             if (!err && res.json && res.json.status === 'valid' && res.json.certificate) {
               context._processing_running = false;
@@ -1125,8 +1208,15 @@ function Order(options) {
               context._processing_running = false;
               emitError(new Error('Order invalid: ' + JSON.stringify(res.json)), 'certificate');
             } else {
-              // Transient error or still processing — keep polling
-              context.processing_timer = setTimeout(processingRound, retryAfterDelay(err ? null : res, 2000));
+              // Transient error or still processing — keep polling. 'pending':
+              // the CA is still deciding (an approval, a slow signer) - the
+              // same event an EST order gives for a 202.
+              let delay = retryAfterDelay(err ? null : res, 2000);
+              if (!err && res.json && res.json.status === 'processing') {
+                context._pending_attempt = (context._pending_attempt || 0) + 1;
+                ev.emit('pending', { retryAfter: Math.round(delay / 1000), attempt: context._pending_attempt });
+              }
+              context.processing_timer = setTimeout(processingRound, delay);
             }
           });
         };
@@ -1140,7 +1230,7 @@ function Order(options) {
       if (context.state === 'certificate' && context.certificate_url !== null && context.cert_fetched === false && context._cert_fetching === false) {
         context._cert_fetching = true;
 
-        context.http.signedRequest(context.certificate_url, '', context.accountKey, context.account_url, function(err, res) {
+        context.http.signedRequest(context.certificate_url, '', context._account, context.account_url, function(err, res) {
           if (context.aborted) return;
           if (err) { emitError(err, 'certificate'); return; }
 
@@ -1148,14 +1238,20 @@ function Order(options) {
             let cert_pem = res.body.toString('utf8');
 
             // Split PEM chain: first = server cert, rest = CA chain
-            let pems = splitPemChain(cert_pem);
+            let pems;
+            try { pems = splitPemChain(cert_pem); } catch (e) { pems = null; }
+            if (!pems || pems.length === 0) {
+              emitError(new Error('the certificate the server returned is not a PEM chain'), 'certificate');
+              return;
+            }
 
             let cert_obj = {
-              cert: pems[0] || cert_pem,
+              cert: pems[0],
               ca: pems.length > 1 ? pems.slice(1) : [],
-              key: context.privateKey,
+              // A signer's private key never passes through here: null.
+              key: isSigner(context.privateKey) ? null : context.privateKey,
               csr: pemEncode(context.csr, 'CERTIFICATE REQUEST'),
-              expiresAt: extractExpiry(pems[0] || cert_pem),
+              expiresAt: extractExpiry(pems[0]),
             };
 
             set_context({ cert: cert_obj, cert_fetched: true });
@@ -1191,13 +1287,10 @@ function Order(options) {
   }
 
 
+  // The certificates of a PEM chain (cryptographic-formats): the leaf first. A
+  // block that does not decode throws — a chain is not guessed at.
   function splitPemChain(pem) {
-    let certs = [];
-    let parts = pem.split('-----BEGIN CERTIFICATE-----');
-    for (let i = 1; i < parts.length; i++) {
-      certs.push('-----BEGIN CERTIFICATE-----' + parts[i].split('-----END CERTIFICATE-----')[0] + '-----END CERTIFICATE-----\n');
-    }
-    return certs;
+    return certificatePems(pem);
   }
 
 
@@ -1246,12 +1339,21 @@ function Order(options) {
       if (options.accountUrl && !options.accountKey) {
         problems.push('accountUrl requires accountKey (the key that registered that account)');
       }
-      let provider_info = PROVIDERS[context.provider];
-      if (!provider_info) {
-        problems.push('unknown provider: ' + context.provider);
-      } else if (context.staging && !provider_info.staging) {
-        problems.push("provider '" + context.provider + "' has no staging environment");
+
+      // A key or signer that cannot work is reported now, by name - not as
+      // a failed signature halfway through the order.
+      let keys = [['accountKey', 'account'], ['privateKey', 'certificate']];
+      for (let i = 0; i < keys.length; i++) {
+        let k = context[keys[i][0]];
+        if (k === null) continue;
+        try {
+          loadKey(k, { use: keys[i][1], signTimeout: context.signTimeout, signRetries: context.signRetries });
+        } catch (e) {
+          problems.push(e.message);
+        }
       }
+      try { context._provider = resolveProvider(context.provider, context.staging); }
+      catch (e) { problems.push(e.message); }
 
       // --- Challenge type / IP identifier rules ---
       let known_types = ['dns-01', 'http-01', 'tls-alpn-01'];

@@ -1,7 +1,7 @@
 {
   "name": "cert-manager",
-  "version": "0.1.0",
-  "description": "ACME client with automatic certificate management for Node.js. Zero dependencies.",
+  "version": "0.7.0",
+  "description": "ACME and EST client with automatic certificate management for Node.js - keys in PEM, or behind an external signer (HSM, KMS, remote signing).",
   "type": "module",
   "main": "./index.cjs",
   "module": "./index.js",
@@ -13,12 +13,18 @@
       "types": "./index.d.ts"
     }
   },
+  "engines": {
+    "node": ">=18"
+  },
   "files": [
     "index.js",
     "index.cjs",
     "index.d.ts",
     "src/"
   ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "keywords": [
     "ssl",
     "tls",
@@ -34,7 +40,14 @@
     "x509",
     "csr",
     "pem",
-    "ecdsa"
+    "ecdsa",
+    "hsm",
+    "kms",
+    "external-signer",
+    "remote-signing",
+    "est",
+    "rfc7030",
+    "pki"
   ],
   "author": {
     "name": "colocohen"
@@ -48,6 +61,9 @@
     "url": "https://github.com/colocohen/cert-manager/issues"
   },
   "homepage": "https://github.com/colocohen/cert-manager#readme",
+  "dependencies": {
+    "cryptographic-formats": "^0.1.0"
+  },
   "funding": [
     {
       "type": "github",
