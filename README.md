@@ -7,7 +7,6 @@
   <a href="https://www.npmjs.com/package/cert-manager">
     <img src="https://img.shields.io/npm/v/cert-manager?color=blue" alt="npm">
   </a>
-  <img src="https://img.shields.io/badge/status-in%20development-yellow" alt="status">
   <img src="https://img.shields.io/github/license/colocohen/cert-manager?color=brightgreen" alt="license">
 </p>
 

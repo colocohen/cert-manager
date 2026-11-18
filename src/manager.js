@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import Order from './order.js';
 import { httpRequest, AcmeHttp } from './http.js';
 import * as net from 'node:net';
-import { createPrivateKey, createPublicKey } from 'node:crypto';
+import * as keys from './keys.js';
 import { x509 } from 'cryptographic-formats';
 import { readCert, certificatePems, spkiHex } from './certs.js';
 import { getAriCertId, getCertDates, canonicalIp } from './crypto.js';
@@ -449,7 +449,7 @@ function Manager(options) {
     let cert, key;
     try { cert = readCert(pem.cert); }
     catch (e) { return { error: new Error('cert is not a PEM certificate: ' + e.message) }; }
-    try { key = createPrivateKey(pem.key); }
+    try { key = keys.privateKey(pem.key); }
     catch (e) { return { error: new Error('key is not a PEM private key: ' + e.message) }; }
     if (pem.ca && !Array.isArray(pem.ca)) {
       try { certificatePems(pem.ca); }
@@ -457,7 +457,7 @@ function Manager(options) {
     }
 
     let certKey = cert.publicKey();
-    if (!certKey || spkiHex(createPublicKey(key)) !== spkiHex(certKey)) {
+    if (!certKey || spkiHex(key) !== spkiHex(certKey)) {
       return { error: new Error('key does not belong to this certificate') };
     }
 

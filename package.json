@@ -1,6 +1,6 @@
 {
   "name": "cert-manager",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "ACME and EST client with automatic certificate management for Node.js - keys in PEM, or behind an external signer (HSM, KMS, remote signing).",
   "type": "module",
   "main": "./index.cjs",
@@ -62,7 +62,8 @@
   },
   "homepage": "https://github.com/colocohen/cert-manager#readme",
   "dependencies": {
-    "cryptographic-formats": "^0.1.0"
+    "cryptographic-formats": "^0.2.0",
+    "cryptographic-primitives": "^0.1.0"
   },
   "funding": [
     {

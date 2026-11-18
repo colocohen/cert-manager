@@ -1,6 +1,6 @@
 
 import { EventEmitter } from 'node:events';
-import * as nodeCrypto from 'node:crypto';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import * as net from 'node:net';
 import { AcmeHttp } from './http.js';
 import { generateKey, createCsr, signEab, base64url, pemEncode, toAsciiDomain, ipToArpa, canonicalIp, createAlpnCertificate, getCertDates, csrToDer } from './crypto.js';
@@ -731,7 +731,7 @@ function Order(options) {
           };
 
           if (ch.type === 'dns-01') {
-            let hash = nodeCrypto.createHash('sha256').update(key_authorization).digest();
+            let hash = sha256_sync(key_authorization);
             challenge_info.domain = '_acme-challenge.' + auth.identifier.value.replace('*.', '');
             challenge_info.value = base64url(hash);
           } else if (ch.type === 'http-01') {
@@ -743,7 +743,7 @@ function Order(options) {
             // RFC 8737: the validation cert carries the SHA-256 digest of the
             // key authorization (as OCTET STRING, inside the critical
             // acmeIdentifier extension) — never the key authorization text.
-            let digest = nodeCrypto.createHash('sha256').update(key_authorization).digest();
+            let digest = sha256_sync(key_authorization);
             challenge_info.key_authorization_digest = new Uint8Array(digest);
             // SNI the CA will send: the identifier itself for domains;
             // the in-addr.arpa / ip6.arpa reverse name for IPs (RFC 8738 §6)

@@ -1,6 +1,7 @@
 
-import * as crypto from 'node:crypto';
 import { signature, jwk as jwkFormat } from 'cryptographic-formats';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
+import * as keys from './keys.js';
 
 
 /**
@@ -8,7 +9,8 @@ import { signature, jwk as jwkFormat } from 'cryptographic-formats';
  *
  * Every place that takes a private key (accountKey, privateKey) takes one of:
  *
- *   - a PEM string - the key is here, and node:crypto signs with it (as always);
+ *   - a PEM string - the key is here, and cryptographic-primitives signs with it
+ *                    (keys.js);
  *   - a signer     - the key is somewhere else (an HSM, a cloud KMS, a remote
  *                    or threshold signing service),
  *                    and this library only ever sees the public key:
@@ -62,38 +64,16 @@ function keyError(code, message, cause) {
 }
 
 
-function toPublicKeyObject(input) {
-  if (input && typeof input === 'object' && typeof input.asymmetricKeyType === 'string' && input.type) {
-    return input.type === 'public' ? input : crypto.createPublicKey(input);   // a KeyObject
-  }
-  if (typeof input === 'string') {
-    return crypto.createPublicKey(input);                                     // PEM
-  }
-  if (input instanceof Uint8Array || Buffer.isBuffer(input)) {
-    return crypto.createPublicKey({ key: Buffer.from(input), format: 'der', type: 'spki' });
-  }
-  if (input && typeof input === 'object' && typeof input.kty === 'string') {
-    if (input.d !== undefined) {
-      // A private JWK handed over as "the public key" would put the secret
-      // into account.json and into every newAccount request.
-      throw new Error('publicKey is a PRIVATE JWK (it has "d") - pass the public members only');
-    }
-    return crypto.createPublicKey({ key: input, format: 'jwk' });
-  }
-  throw new Error('publicKey must be SPKI PEM, SPKI DER bytes, a JWK, or a KeyObject');
-}
-
-
+// What a key can sign with, from its type (keys.js): an ECDSA curve or RSA.
 function algorithmsFor(publicKey) {
-  let type = publicKey.asymmetricKeyType;
+  let type = publicKey.type;
   if (type === 'ec') {
-    let crv = publicKey.export({ format: 'jwk' }).crv;
-    let alg = EC_ALGS[crv];
-    if (!alg) throw new Error('unsupported EC curve: ' + crv + ' (supported: P-256, P-384, P-521)');
+    let alg = EC_ALGS[publicKey.curve];
+    if (!alg) throw new Error('unsupported EC curve: ' + publicKey.curve + ' (supported: P-256, P-384, P-521)');
     return alg;
   }
   if (type === 'rsa') {
-    let bits = publicKey.asymmetricKeyDetails && publicKey.asymmetricKeyDetails.modulusLength;
+    let bits = publicKey.bits;
     if (bits && bits < 2048) throw new Error('RSA key size must be at least 2048 bits (got ' + bits + ')');
     return RSA_ALG;
   }
@@ -105,24 +85,20 @@ function algorithmsFor(publicKey) {
   throw new Error('unsupported key type: ' + type + ' (supported: ec, rsa)');
 }
 
-
-function publicJwk(publicKey) {
-  let j = publicKey.export({ format: 'jwk' });
-  if (j.kty === 'EC') return { kty: 'EC', crv: j.crv, x: j.x, y: j.y };
-  return { kty: 'RSA', n: j.n, e: j.e };
+/** The public JWK of a key (keys.js): only the public members, in RFC 7638's set. */
+function publicJwk(key) {
+  return key.jwk;
 }
-
 
 /**
  * RFC 7638 thumbprint of a public JWK, base64url - what ACME puts after the
  * token in every key authorization. cryptographic-formats supplies the canonical
- * bytes; the hash is node's.
+ * bytes; the hash is cryptographic-primitives'.
  */
 function jwkThumbprint(jwk) {
   let input = jwkFormat.thumbprint_input(jwk);
-  return Buffer.from(crypto.createHash('sha256').update(input).digest()).toString('base64url');
+  return Buffer.from(sha256_sync(input)).toString('base64url');
 }
-
 
 function toBytes(x) {
   if (x instanceof Uint8Array) return new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
@@ -141,7 +117,7 @@ function toBytes(x) {
  * Returns:
  *   {
  *     loaded: true, signer: bool, source: input,
- *     publicKey (KeyObject), spki (Uint8Array), jwk (public), thumbprint,
+ *     publicKey (keys.js), spki (Uint8Array), jwk (public), thumbprint,
  *     alg: { jws, x509, hash, curve },
  *     sign(bytes, form, cb)   form 'raw' (JOSE) or 'der' (X.509); cb(err, Uint8Array)
  *   }
@@ -159,10 +135,10 @@ function loadKey(input, opts) {
   try {
     if (isSigner(input)) {
       if (input.publicKey == null) throw new Error('a signer needs publicKey');
-      publicKey = toPublicKeyObject(input.publicKey);
+      publicKey = keys.publicKey(input.publicKey);
     } else if (typeof input === 'string' || Buffer.isBuffer(input)) {
-      privateKey = crypto.createPrivateKey(input);
-      publicKey = crypto.createPublicKey(privateKey);
+      privateKey = keys.privateKey(input);
+      publicKey = privateKey;
     } else {
       throw new Error('expected a PEM private key or a signer { publicKey, sign }');
     }
@@ -199,8 +175,8 @@ function loadKey(input, opts) {
   let timeout = opts.signTimeout > 0 ? opts.signTimeout : DEFAULT_SIGN_TIMEOUT;
   let retries = (opts.signRetries >= 0) ? opts.signRetries : DEFAULT_SIGN_RETRIES;
 
-  let spki = new Uint8Array(publicKey.export({ type: 'spki', format: 'der' }));
-  let jwk = publicJwk(publicKey);
+  let spki = publicKey.spki;
+  let jwk = publicKey.jwk;
 
   let key = {
     loaded: true,
@@ -215,18 +191,15 @@ function loadKey(input, opts) {
     sign: null,
   };
 
-  // --- Local key: node:crypto, as before ---
+  // --- Local key: cryptographic-primitives (keys.js) ---
   function signLocal(bytes, form, cb) {
     let sig;
     try {
-      sig = crypto.sign(alg.hash, Buffer.from(bytes), {
-        key: privateKey,
-        dsaEncoding: form === 'raw' ? 'ieee-p1363' : 'der',
-      });
+      sig = privateKey.sign(alg.hash, bytes, form);
     } catch (e) {
       return setImmediate(cb, keyError('SIGN_REJECTED', what + ': local signing failed: ' + e.message, e));
     }
-    setImmediate(cb, null, new Uint8Array(sig));
+    setImmediate(cb, null, sig);
   }
 
   // --- Signer: timeout, retries, format conversion, verification ---
@@ -296,11 +269,7 @@ function loadKey(input, opts) {
       // Verify before anything leaves: a signature by another key, or in the
       // other format, would otherwise come back from the CA as an opaque
       // badSignature - after a nonce, a request and a round trip were spent.
-      let ok = false;
-      try {
-        ok = crypto.verify(alg.hash, Buffer.from(bytes),
-          { key: publicKey, dsaEncoding: form === 'raw' ? 'ieee-p1363' : 'der' }, Buffer.from(out));
-      } catch (e) { ok = false; }
+      let ok = publicKey.verify({ scheme: alg.curve ? 'ecdsa' : 'pkcs1', hash: alg.hash, form: form }, bytes, out);
 
       if (!ok) {
         return setImmediate(cb, keyError('SIGN_INVALID', what + ': the signature does not verify under publicKey ' +

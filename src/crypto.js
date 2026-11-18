@@ -1,5 +1,11 @@
 
-import * as crypto from 'node:crypto';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
+import { hmac_sync } from 'cryptographic-primitives/hmac.js';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+import { p256, p384 } from 'cryptographic-primitives/nist.js';
+import * as RSA from 'cryptographic-primitives/rsa.js';
+import * as PKCS8 from 'cryptographic-formats/pkcs8';
+import * as keys from './keys.js';
 import * as net from 'node:net';
 import { domainToASCII } from 'node:url';
 import { jws, x509, x509_build, csr_build, pem } from 'cryptographic-formats';
@@ -27,32 +33,35 @@ function generateKey(type, options) {
     if (size < 2048) {
       throw new Error('RSA key size must be at least 2048 bits (got ' + size + ')');
     }
-    let pair = crypto.generateKeyPairSync('rsa', {
-      modulusLength: size,
-      publicKeyEncoding: { type: 'spki', format: 'pem' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-    });
-    return pair.privateKey;
+    let k = RSA.keygen_sync(size);
+    let b = function (n) { return bigBytes(n); };
+    return pem.encode(PKCS8.to_der({ algorithm: 'rsaEncryption', rsa: {
+      n: b(k.n), e: b(k.e), d: b(k.d), p: b(k.p), q: b(k.q), dp: b(k.dp), dq: b(k.dq), qinv: b(k.qinv) } }), 'PRIVATE KEY');
   }
 
   if (type !== 'ecdsa') {
     throw new Error('Unsupported key type: ' + type + ' (supported: ecdsa, rsa)');
   }
 
-  // ecdsa — map NIST names to OpenSSL curve names (works on all Node versions)
+  // ecdsa — the NIST name, the library's curve and cryptographic-formats' name
   let curve = options.curve || 'P-256';
-  let curve_map = { 'P-256': 'prime256v1', 'P-384': 'secp384r1' };
-  let namedCurve = curve_map[curve];
-  if (!namedCurve) {
+  let curve_map = { 'P-256': [p256, 'secp256r1'], 'P-384': [p384, 'secp384r1'] };
+  let c = curve_map[curve];
+  if (!c) {
     throw new Error('Unsupported curve: ' + curve + ' (supported: P-256, P-384)');
   }
 
-  let pair = crypto.generateKeyPairSync('ec', {
-    namedCurve: namedCurve,
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-  });
-  return pair.privateKey;
+  let kp = c[0].keygen_sync();
+  let der = PKCS8.to_der({ algorithm: 'ecPublicKey', curve: c[1], scalar: kp.sk, point: c[0].get_public_key_sync(kp.sk, false) });
+  kp.sk.fill(0);
+  return pem.encode(der, 'PRIVATE KEY');
+}
+
+// A non-negative bigint as big-endian bytes.
+function bigBytes(n) {
+  let h = n.toString(16);
+  let buf = Buffer.from(h.length % 2 ? '0' + h : h, 'hex');
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
 
 
@@ -62,7 +71,7 @@ function generateKey(type, options) {
  */
 function getJwk(key) {
   if (isSigner(key)) return loadKey(key, { use: 'account' }).jwk;
-  return publicJwk(crypto.createPublicKey(crypto.createPrivateKey(key)));
+  return publicJwk(keys.privateKey(key));
 }
 
 
@@ -308,11 +317,10 @@ function createCsr(options, private_key, callback) {
     throw new Error('createCsr: a signer signs asynchronously - pass a callback: createCsr(options, signer, function(err, der) {})');
   }
 
-  let key_obj = crypto.createPrivateKey(private_key);
   let key = loadKey(private_key, { use: 'certificate' });
   let prepared = csrRequest(options, key);
-  let sig = crypto.sign(key.alg.hash, Buffer.from(prepared.bytes), key_obj);   // DER for ECDSA, as X.509 wants
-  return csr_build.assemble(prepared, new Uint8Array(sig));
+  let sig = keys.privateKey(private_key).sign(key.alg.hash, prepared.bytes, 'der');   // DER for ECDSA, as X.509 wants
+  return csr_build.assemble(prepared, sig);
 }
 
 
@@ -341,10 +349,9 @@ function createAlpnCertificate(identifier, key_authorization) {
   // Fresh key just for the challenge cert — never reuse the account or
   // certificate keys for a throwaway self-signed artifact
   let key_pem = generateKey('ecdsa', { curve: 'P-256' });
-  let key_obj = crypto.createPrivateKey(key_pem);
-  let pub_der = crypto.createPublicKey(key_obj).export({ type: 'spki', format: 'der' });
+  let key = keys.privateKey(key_pem);
 
-  let digest = crypto.createHash('sha256').update(key_authorization).digest();
+  let digest = sha256_sync(key_authorization);
   let authorization = new Uint8Array(2 + digest.length);
   authorization[0] = 0x04;                 // OCTET STRING
   authorization[1] = digest.length;        // 32
@@ -358,14 +365,14 @@ function createAlpnCertificate(identifier, key_authorization) {
 
   let now = Date.now();
   let tbs = x509_build.prepare({
-    serial: crypto.randomBytes(12),
+    serial: random_bytes_sync(12),
     issuer: name,
     subject: name,
     validity: {
       not_before: new Date(now - 5 * 60000),        // 5 min back — clock skew
       not_after: new Date(now + 24 * 3600000),      // challenges live minutes, 24h is plenty
     },
-    public_key: new Uint8Array(pub_der),
+    public_key: key.spki,
     signature_algorithm: 'ecdsaWithSHA256',
     extensions: {
       // SAN — exactly one entry (RFC 8737: "and no other entries")
@@ -375,8 +382,8 @@ function createAlpnCertificate(identifier, key_authorization) {
     },
   });
 
-  let signature = crypto.sign('sha256', Buffer.from(tbs.bytes), key_obj);
-  let cert_der = x509_build.assemble(tbs, new Uint8Array(signature));
+  let signature = key.sign('sha256', tbs.bytes, 'der');
+  let cert_der = x509_build.assemble(tbs, signature);
 
   return {
     cert: pemEncode(cert_der, 'CERTIFICATE'),
@@ -432,11 +439,10 @@ function signJws(payload, protected_header, private_key, callback) {
     throw new Error('signJws: a signer signs asynchronously - pass a callback: signJws(payload, header, signer, function(err, jws) {})');
   }
 
-  let key_obj = crypto.createPrivateKey(private_key);
   let key = loadKey(private_key, { use: 'account' });
   let prepared = jwsRequest(payload, protected_header, key);
-  let sig = crypto.sign(key.alg.hash, Buffer.from(prepared.bytes), { key: key_obj, dsaEncoding: 'ieee-p1363' });
-  return jws.assemble(prepared, new Uint8Array(sig), { serialization: 'flattened' });
+  let sig = keys.privateKey(private_key).sign(key.alg.hash, prepared.bytes, 'raw');
+  return jws.assemble(prepared, sig, { serialization: 'flattened' });
 }
 
 
@@ -477,8 +483,8 @@ function signEab(eab_kid, eab_hmac_key, account_jwk, url) {
   // RFC 8555 §7.3.4 says base64url; some CAs hand out standard base64.
   // Node's 'base64' decoder reads both alphabets.
   let hmac_key = Buffer.from(eab_hmac_key, 'base64');
-  let mac = crypto.createHmac('sha256', hmac_key).update(Buffer.from(prepared.bytes)).digest();
-  return jws.assemble(prepared, new Uint8Array(mac), { serialization: 'flattened' });
+  let mac = hmac_sync(sha256_sync, hmac_key, prepared.bytes);
+  return jws.assemble(prepared, mac, { serialization: 'flattened' });
 }
 
 

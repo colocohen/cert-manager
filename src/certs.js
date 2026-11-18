@@ -7,7 +7,7 @@
 // decision, not a format, so it is not cryptographic-formats'): a change to one
 // belongs in the other.
 
-import * as nodeCrypto from 'node:crypto';
+import * as keys from './keys.js';
 import { x509, pem } from 'cryptographic-formats';
 
 function bytesEqual(a, b) {
@@ -70,17 +70,17 @@ function readCert(input) {
     notAfter: cf.validity.not_after.date,
     publicKey: function() {
       if (key === undefined) {
-        try { key = nodeCrypto.createPublicKey({ key: Buffer.from(cf.public_key.der), format: 'der', type: 'spki' }); }
-        catch (e) { key = null; }
+        try { key = keys.publicKey(cf.public_key); } catch (e) { key = null; }
+        if (key && !key.spki) key = null;   // a kind keys.js does not read
       }
       return key;
     },
   };
 }
 
-/** A public key's SPKI DER, as node:crypto exports it (one encoding per key), in hex. */
-function spkiHex(keyObject) {
-  return Buffer.from(keyObject.export({ type: 'spki', format: 'der' })).toString('hex');
+/** A public key's SPKI DER (keys.js: one encoding per key), in hex. */
+function spkiHex(key) {
+  return Buffer.from(key.spki).toString('hex');
 }
 
 /**
@@ -104,33 +104,21 @@ function issuedBy(cert, issuer) {
 
 /**
  * Is `cert`'s signature by `signerCert`'s key? The algorithm as cryptographic-formats
- * describes it, the check node:crypto's. One node:crypto cannot make —
- * RSASSA-PSS whose mask hash is not its message hash, MD2 — does not verify.
+ * describes it, checked by cryptographic-primitives (keys.js). One it cannot
+ * check — DSA, MD2 — does not verify; nor PKCS#1 v1.5 by an RSASSA-PSS key.
  */
 function signedBy(cert, signerCert) {
   let key = signerCert.publicKey();
   if (!key) return false;
   let p = cert.cf.signature_params, tbs = cert.cf.tbs_bytes, sig = cert.cf.signature;
-  try {
-    switch (p.scheme) {
-      case 'pkcs1':
-        return nodeCrypto.verify(p.hash, tbs, { key: key, padding: nodeCrypto.constants.RSA_PKCS1_PADDING }, sig);
-      case 'pss':
-        if (p.pss.mgf !== 'mgf1' || p.pss.mgf_hash !== p.pss.hash) return false;
-        return nodeCrypto.verify(p.pss.hash, tbs, { key: key, padding: nodeCrypto.constants.RSA_PKCS1_PSS_PADDING,
-                                                    saltLength: p.pss.salt_length }, sig);
-      case 'ecdsa':
-      case 'dsa':
-        return nodeCrypto.verify(p.hash, tbs, key, sig);
-      case 'eddsa':
-      case 'ml-dsa':
-      case 'slh-dsa':
-        return nodeCrypto.verify(null, tbs, key, sig);
-      default:
-        return false;
-    }
-  } catch (e) {
-    return false;
+  switch (p.scheme) {
+    case 'pkcs1': return keys.verify(key, { scheme: 'pkcs1', hash: p.hash }, tbs, sig);
+    case 'pss':
+      if (p.pss.mgf !== 'mgf1') return false;
+      return keys.verify(key, { scheme: 'pss', hash: p.pss.hash, mgf_hash: p.pss.mgf_hash, salt_length: p.pss.salt_length }, tbs, sig);
+    case 'ecdsa': return keys.verify(key, { scheme: 'ecdsa', hash: p.hash, form: 'der' }, tbs, sig);
+    case 'eddsa': case 'ml-dsa': case 'slh-dsa': return keys.verify(key, { scheme: p.scheme }, tbs, sig);
+    default: return false;
   }
 }
 

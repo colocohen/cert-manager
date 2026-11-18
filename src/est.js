@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import * as https from 'node:https';
-import * as nodeCrypto from 'node:crypto';
+import * as keys from './keys.js';
 import * as net from 'node:net';
 import { cms, csr as csrFormat, pem } from 'cryptographic-formats';
 import { generateKey, createCsr, pemEncode, canonicalIp, getCertDates, csrToDer } from './crypto.js';
@@ -167,11 +167,11 @@ function EstOrder(options) {
     createCsr(opts, context.privateKey, cb);
   }
 
-  // The CSR's public key, as node:crypto exports it — the form the
+  // The CSR's public key in one encoding (keys.js) — the form the
   // certificate's is compared in, so two encodings of one key are equal
   function spkiOfCsr(der) {
     let parsed = csrFormat.from_der(der);
-    return spkiHex(nodeCrypto.createPublicKey({ key: Buffer.from(parsed.public_key.der), format: 'der', type: 'spki' }));
+    return spkiHex(keys.publicKey(parsed.public_key));
   }
 
   // The chain to send with the certificate: from its issuer up, through the
